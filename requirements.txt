@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+faiss-cpu
+sentence-transformers
+python-dotenv
+requests
+PyPDF2
+python-docx
+pyodbc
+tqdm
+google-generativeai
+
+pytest
+httpx

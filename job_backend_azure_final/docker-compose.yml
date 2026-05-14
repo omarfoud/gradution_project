@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  ai-job-backend:
+    build: .
+    container_name: ai-job-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+      DB_PATH: /app/jobs.db
+      INDEX_PATH: /app/jobs.index
+      MODEL_NAME: all-MiniLM-L6-v2
+      DEVICE: cpu
+      SQL_PORT: 1433
+      SQL_DRIVER: ODBC Driver 18 for SQL Server
+    volumes:
+      - ./jobs.db:/app/jobs.db
+      - ./jobs.index:/app/jobs.index
+      - ./job_descriptions.csv:/app/job_descriptions.csv:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

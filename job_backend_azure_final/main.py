@@ -1,0 +1,830 @@
+import io
+import logging
+import os
+import sqlite3
+from contextlib import asynccontextmanager
+from functools import lru_cache
+from typing import Optional
+
+import docx
+import faiss
+import google.generativeai as genai
+import pyodbc
+import PyPDF2
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from sentence_transformers import SentenceTransformer
+
+load_dotenv()
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("job-assistant")
+
+# -----------------------------
+# Configuration
+# -----------------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL_NAME = os.getenv("MODEL_NAME", "all-MiniLM-L6-v2")
+DEVICE = os.getenv("DEVICE", "cpu")
+
+DB_PATH = os.getenv("DB_PATH", "jobs.db")
+INDEX_PATH = os.getenv("INDEX_PATH", "jobs.index")
+
+SQL_SERVER = os.getenv("SQL_SERVER")
+SQL_PORT = os.getenv("SQL_PORT", "1433")
+SQL_DATABASE = os.getenv("SQL_DATABASE")
+SQL_USERNAME = os.getenv("SQL_USERNAME")
+SQL_PASSWORD = os.getenv("SQL_PASSWORD")
+SQL_DRIVER = os.getenv("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
+
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
+
+FAISS_TOP_K = int(os.getenv("FAISS_TOP_K", "500"))
+RESULTS_LIMIT = int(os.getenv("RESULTS_LIMIT", "10"))
+MAX_CV_CHARS = int(os.getenv("MAX_CV_CHARS", "4000"))
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
+SQL_BATCH_SIZE = int(os.getenv("SQL_BATCH_SIZE", "900"))
+REQUIRE_REMOTE_RESUME_URL = os.getenv("REQUIRE_REMOTE_RESUME_URL", "true").lower() in {"1", "true", "yes", "y"}
+
+MODEL: Optional[SentenceTransformer] = None
+INDEX = None
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    logger.warning("GEMINI_API_KEY is not configured. /chat and /analyze-job-id will fail until it is set.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global MODEL, INDEX
+
+    # Company endpoints can work with Azure SQL + Gemini only.
+    # Applicant matching endpoints need jobs.db + jobs.index.
+    if not os.path.exists(DB_PATH) or not os.path.exists(INDEX_PATH):
+        logger.warning(
+            "jobs.db or jobs.index not found. Applicant matching/search endpoints will return 503 until you run: python ingest.py"
+        )
+    else:
+        logger.info("Loading embedding model: %s on %s", MODEL_NAME, DEVICE)
+        MODEL = SentenceTransformer(MODEL_NAME, device=DEVICE)
+
+        logger.info("Loading FAISS index: %s", INDEX_PATH)
+        INDEX = faiss.read_index(INDEX_PATH)
+        if hasattr(INDEX, "nprobe"):
+            INDEX.nprobe = int(os.getenv("FAISS_NPROBE", "20"))
+
+    logger.info("Backend is ready")
+    yield
+
+
+app = FastAPI(title="Job Assistant API", version="4.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# -----------------------------
+# Request models
+# -----------------------------
+class RecommendRequest(BaseModel):
+    user_id: str = Field(..., min_length=1)
+    location: Optional[str] = None
+    work_type: Optional[str] = None
+    experience: Optional[str] = None
+    limit: int = Field(default=5, ge=1, le=50)
+
+
+class AnalyzeJobRequest(BaseModel):
+    user_id: str = Field(..., min_length=1)
+    job_id: int
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    location: Optional[str] = None
+    work_type: Optional[str] = None
+    experience: Optional[str] = None
+    limit: int = Field(default=10, ge=1, le=50)
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+
+
+class CompanyContextRequest(BaseModel):
+    # Send company_user_id after company login. It should be ApplicationUser.Id from the frontend auth/session.
+    # company_id can be used for local tests if the frontend does not have the user id yet.
+    company_user_id: Optional[str] = None
+    company_id: Optional[int] = None
+
+
+class CompanyChatRequest(CompanyContextRequest):
+    message: str = Field(..., min_length=1)
+    job_posting_id: Optional[int] = None
+
+
+class CompanyJobPostRequest(CompanyContextRequest):
+    job_posting_id: int
+
+
+class CompanyFindCandidatesRequest(CompanyContextRequest):
+    job_posting_id: int
+    limit: int = Field(default=10, ge=1, le=25)
+
+
+class CompanyGenerateJobPostRequest(CompanyContextRequest):
+    role: str = Field(..., min_length=1)
+    level: Optional[str] = None
+    skills: list[str] = Field(default_factory=list)
+    work_type: Optional[str] = None
+    location: Optional[str] = None
+    salary_range: Optional[str] = None
+
+
+class CompanyHiringInsightsRequest(CompanyContextRequest):
+    job_posting_id: Optional[int] = None
+
+
+# -----------------------------
+# DB helpers
+# -----------------------------
+def get_jobs_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_app_db():
+    missing = [
+        name
+        for name, value in {
+            "SQL_SERVER": SQL_SERVER,
+            "SQL_DATABASE": SQL_DATABASE,
+            "SQL_USERNAME": SQL_USERNAME,
+            "SQL_PASSWORD": SQL_PASSWORD,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise HTTPException(status_code=500, detail=f"Missing SQL Server environment variables: {', '.join(missing)}")
+
+    conn_str = (
+        f"DRIVER={{{SQL_DRIVER}}};"
+        f"SERVER={SQL_SERVER},{SQL_PORT};"
+        f"DATABASE={SQL_DATABASE};"
+        f"UID={SQL_USERNAME};"
+        f"PWD={SQL_PASSWORD};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=yes;"
+    )
+    return pyodbc.connect(conn_str, timeout=10)
+
+
+# -----------------------------
+# Resume helpers
+# -----------------------------
+def get_resume_path_by_user_id(user_id: str) -> str:
+    conn = get_app_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT TOP 1 r.FilePath
+            FROM Applicant a
+            JOIN Resume r ON r.ApplicantID = a.ApplicantID
+            WHERE a.UserId = ? AND r.IsActive = 1
+            ORDER BY r.UploadDate DESC
+            """,
+            user_id,
+        )
+        row = cursor.fetchone()
+    except pyodbc.Error as exc:
+        raise HTTPException(status_code=500, detail=f"SQL Server query failed: {exc}") from exc
+    finally:
+        conn.close()
+
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail="Active resume not found for this user")
+    return str(row[0])
+
+
+def load_resume_bytes(resume_path: str) -> bytes:
+    if resume_path.startswith(("http://", "https://")):
+        try:
+            response = requests.get(resume_path, timeout=REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            return response.content
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to download resume: {exc}") from exc
+
+    if REQUIRE_REMOTE_RESUME_URL:
+        raise HTTPException(
+            status_code=400,
+            detail="Resume.FilePath must be an http/https URL in production. Use Azure Blob Storage or set REQUIRE_REMOTE_RESUME_URL=false for local testing.",
+        )
+
+    if not os.path.exists(resume_path):
+        raise HTTPException(status_code=404, detail=f"Resume file not found: {resume_path}")
+
+    try:
+        with open(resume_path, "rb") as file_obj:
+            return file_obj.read()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read local resume file: {exc}") from exc
+
+
+def extract_text(file_content: bytes, filename: str) -> str:
+    lower_name = filename.lower().split("?")[0]
+    try:
+        if lower_name.endswith(".pdf"):
+            reader = PyPDF2.PdfReader(io.BytesIO(file_content))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        elif lower_name.endswith(".docx"):
+            document = docx.Document(io.BytesIO(file_content))
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        else:
+            raise HTTPException(status_code=400, detail="Only PDF and DOCX resumes are supported")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read resume file: {exc}") from exc
+
+    cleaned_text = text.strip()
+    if not cleaned_text:
+        raise HTTPException(status_code=400, detail="Resume text extraction returned empty content")
+    return cleaned_text[:MAX_CV_CHARS]
+
+
+@lru_cache(maxsize=256)
+def get_resume_text_for_user(user_id: str) -> str:
+    resume_path = get_resume_path_by_user_id(user_id)
+    file_content = load_resume_bytes(resume_path)
+    return extract_text(file_content, resume_path)
+
+
+# -----------------------------
+# Job search helpers
+# -----------------------------
+@lru_cache(maxsize=512)
+def encode_query_cached(query_text: str):
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Embedding model is not loaded yet")
+    vector = MODEL.encode([query_text], convert_to_numpy=True).astype("float32")
+    faiss.normalize_L2(vector)
+    return vector
+
+
+def fetch_jobs_by_faiss_ids(conn: sqlite3.Connection, faiss_ids: list[int], filters: dict) -> list[sqlite3.Row]:
+    rows: list[sqlite3.Row] = []
+    for start in range(0, len(faiss_ids), SQL_BATCH_SIZE):
+        batch = faiss_ids[start : start + SQL_BATCH_SIZE]
+        placeholders = ",".join(["?"] * len(batch))
+        query = f"SELECT * FROM jobs WHERE faiss_id IN ({placeholders})"
+        params: list = list(batch)
+
+        conditions = []
+        if filters.get("location"):
+            conditions.append("location LIKE ?")
+            params.append(f"%{filters['location']}%")
+        if filters.get("work_type"):
+            conditions.append("work_type LIKE ?")
+            params.append(f"%{filters['work_type']}%")
+        if filters.get("experience"):
+            conditions.append("experience LIKE ?")
+            params.append(f"%{filters['experience']}%")
+
+        if conditions:
+            query += " AND " + " AND ".join(conditions)
+        rows.extend(conn.execute(query, params).fetchall())
+    return rows
+
+
+def search_hybrid(query_text: str, *, k: int = RESULTS_LIMIT, location: Optional[str] = None, work_type: Optional[str] = None, experience: Optional[str] = None):
+    if INDEX is None:
+        raise HTTPException(status_code=503, detail="FAISS index is not loaded yet. Run python ingest.py to create jobs.db and jobs.index.")
+    if not os.path.exists(DB_PATH):
+        raise HTTPException(status_code=503, detail="jobs.db is missing. Run python ingest.py.")
+
+    vector = encode_query_cached(query_text.strip())
+    distances, indices = INDEX.search(vector, FAISS_TOP_K)
+
+    valid_ids = [int(idx) for idx in indices[0] if idx != -1]
+    if not valid_ids:
+        return []
+
+    # Keep similarity score to return a useful ranking signal.
+    score_by_id = {int(idx): float(score) for idx, score in zip(indices[0], distances[0]) if idx != -1}
+    id_to_rank = {idx: rank for rank, idx in enumerate(valid_ids)}
+
+    conn = get_jobs_db()
+    try:
+        rows = fetch_jobs_by_faiss_ids(conn, valid_ids, {"location": location, "work_type": work_type, "experience": experience})
+    finally:
+        conn.close()
+
+    sorted_rows = sorted(rows, key=lambda r: id_to_rank.get(r["faiss_id"], 10**9))
+
+    results = []
+    seen = set()
+    for row in sorted_rows:
+        job_id = row["job_id"]
+        if job_id in seen:
+            continue
+        item = dict(row)
+        item["similarity_score"] = round(score_by_id.get(row["faiss_id"], 0.0), 4)
+        results.append(item)
+        seen.add(job_id)
+        if len(results) >= k:
+            break
+    return results
+
+
+# -----------------------------
+# Prompt helpers
+# -----------------------------
+def build_analysis_prompt(job_row: sqlite3.Row, resume_text: str) -> str:
+    return f"""
+You are an expert career-matching assistant.
+Compare the candidate CV against the job and be direct, practical, and fair.
+
+Job:
+- Title: {job_row['title']}
+- Company: {job_row['company']}
+- Experience: {job_row['experience']}
+- Work Type: {job_row['work_type']}
+- Salary Range: {job_row['salary_range']}
+- Qualifications: {job_row['qualifications']}
+- Responsibilities: {job_row['responsibilities']}
+- Skills: {job_row['skills']}
+- Description: {(job_row['description'] or '')[:1500]}
+
+Candidate CV:
+{resume_text[:2200]}
+
+Return a clear structured answer with:
+1. Match percentage
+2. Why this percentage
+3. Strengths
+4. Missing skills / gaps
+5. Short improvement plan
+""".strip()
+
+
+def generate_text(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured")
+    try:
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        response = model.generate_content(prompt)
+        return response.text or "No response generated."
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
+
+
+
+# -----------------------------
+# Company AI helpers
+# -----------------------------
+def ensure_company_context(company_user_id: Optional[str], company_id: Optional[int]) -> dict:
+    if not company_user_id and company_id is None:
+        raise HTTPException(status_code=400, detail="Send company_user_id from logged-in company session or company_id for local testing")
+
+    conn = get_app_db()
+    try:
+        cursor = conn.cursor()
+        if company_id is not None:
+            cursor.execute(
+                """
+                SELECT TOP 1 CompanyID, Name, Industry, WebsiteURL, HeadquarterAddress, Location, LogoUrl, UserId
+                FROM Company
+                WHERE CompanyID = ?
+                """,
+                company_id,
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT TOP 1 CompanyID, Name, Industry, WebsiteURL, HeadquarterAddress, Location, LogoUrl, UserId
+                FROM Company
+                WHERE UserId = ?
+                """,
+                company_user_id,
+            )
+        row = cursor.fetchone()
+    except pyodbc.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Company lookup failed: {exc}") from exc
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Company not found for this logged-in user")
+
+    return {
+        "company_id": row[0],
+        "name": row[1],
+        "industry": row[2],
+        "website_url": row[3],
+        "headquarter_address": row[4],
+        "location": row[5],
+        "logo_url": row[6],
+        "user_id": row[7],
+    }
+
+
+def get_company_job_posting(company_id: int, job_posting_id: int) -> dict:
+    conn = get_app_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT TOP 1 JobID, Title, Description, Requirements, SalaryRange, PostedDate, IsActive, IsRemote, CompanyID, JobType
+            FROM JobPosting
+            WHERE JobID = ? AND CompanyID = ?
+            """,
+            job_posting_id,
+            company_id,
+        )
+        row = cursor.fetchone()
+    except pyodbc.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Job posting lookup failed: {exc}") from exc
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Job posting not found for this company")
+
+    return {
+        "job_id": row[0],
+        "title": row[1],
+        "description": row[2],
+        "requirements": row[3],
+        "salary_range": row[4],
+        "posted_date": str(row[5]) if row[5] else None,
+        "is_active": bool(row[6]),
+        "is_remote": bool(row[7]),
+        "company_id": row[8],
+        "job_type": str(row[9]) if row[9] is not None else None,
+    }
+
+
+def get_company_summary_for_prompt(company: dict) -> str:
+    return f"""
+Company:
+- ID: {company['company_id']}
+- Name: {company['name']}
+- Industry: {company['industry']}
+- Website: {company['website_url']}
+- HQ: {company['headquarter_address']}
+- Location: {company['location']}
+""".strip()
+
+
+def get_company_kpis(company_id: int, job_posting_id: Optional[int] = None) -> dict:
+    conn = get_app_db()
+    try:
+        cursor = conn.cursor()
+        if job_posting_id:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM Application a
+                JOIN JobPosting jp ON jp.JobID = a.JobPostingID
+                WHERE jp.CompanyID = ? AND jp.JobID = ?
+                """,
+                company_id,
+                job_posting_id,
+            )
+            applications_count = int(cursor.fetchone()[0])
+
+            cursor.execute(
+                """
+                SELECT TOP 10 CAST(a.ApplicationStatus AS NVARCHAR(100)) AS StatusName, COUNT(*) AS Total
+                FROM Application a
+                JOIN JobPosting jp ON jp.JobID = a.JobPostingID
+                WHERE jp.CompanyID = ? AND jp.JobID = ?
+                GROUP BY CAST(a.ApplicationStatus AS NVARCHAR(100))
+                ORDER BY Total DESC
+                """,
+                company_id,
+                job_posting_id,
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM Application a
+                JOIN JobPosting jp ON jp.JobID = a.JobPostingID
+                WHERE jp.CompanyID = ?
+                """,
+                company_id,
+            )
+            applications_count = int(cursor.fetchone()[0])
+
+            cursor.execute(
+                """
+                SELECT TOP 10 CAST(a.ApplicationStatus AS NVARCHAR(100)) AS StatusName, COUNT(*) AS Total
+                FROM Application a
+                JOIN JobPosting jp ON jp.JobID = a.JobPostingID
+                WHERE jp.CompanyID = ?
+                GROUP BY CAST(a.ApplicationStatus AS NVARCHAR(100))
+                ORDER BY Total DESC
+                """,
+                company_id,
+            )
+        status_breakdown = [{"status": str(r[0]), "count": int(r[1])} for r in cursor.fetchall()]
+
+        cursor.execute(
+            """
+            SELECT TOP 10 jp.JobID, jp.Title, COUNT(a.ApplicationID) AS ApplicationCount
+            FROM JobPosting jp
+            LEFT JOIN Application a ON a.JobPostingID = jp.JobID
+            WHERE jp.CompanyID = ?
+            GROUP BY jp.JobID, jp.Title
+            ORDER BY ApplicationCount DESC
+            """,
+            company_id,
+        )
+        top_jobs = [{"job_id": r[0], "title": r[1], "application_count": int(r[2])} for r in cursor.fetchall()]
+    except pyodbc.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Company KPI query failed: {exc}") from exc
+    finally:
+        conn.close()
+
+    return {"applications_count": applications_count, "status_breakdown": status_breakdown, "top_jobs": top_jobs}
+
+
+def get_candidates_for_job(company_id: int, job_posting_id: int, limit: int) -> list[dict]:
+    # Keep TOP value controlled by Pydantic limit to avoid SQL injection.
+    limit = max(1, min(int(limit), 25))
+    conn = get_app_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT TOP {limit}
+                app.ApplicationID,
+                applicant.ApplicantID,
+                applicant.FirstName,
+                applicant.LastName,
+                applicant.Location,
+                app.ApplicationStatus,
+                app.AppliedDate,
+                COALESCE(submittedResume.FilePath, activeResume.FilePath) AS ResumePath
+            FROM Application app
+            JOIN JobPosting jp ON jp.JobID = app.JobPostingID
+            JOIN Applicant applicant ON applicant.ApplicantID = app.ApplicantID
+            LEFT JOIN Resume submittedResume ON submittedResume.ResumeID = app.ResumeID
+            LEFT JOIN Resume activeResume ON activeResume.ApplicantID = applicant.ApplicantID AND activeResume.IsActive = 1
+            WHERE jp.CompanyID = ? AND jp.JobID = ?
+            ORDER BY app.AppliedDate DESC
+            """,
+            company_id,
+            job_posting_id,
+        )
+        rows = cursor.fetchall()
+    except pyodbc.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Candidates query failed: {exc}") from exc
+    finally:
+        conn.close()
+
+    return [
+        {
+            "application_id": r[0],
+            "applicant_id": r[1],
+            "name": f"{r[2] or ''} {r[3] or ''}".strip(),
+            "location": r[4],
+            "application_status": str(r[5]) if r[5] is not None else None,
+            "applied_date": str(r[6]) if r[6] else None,
+            "resume_path": r[7],
+        }
+        for r in rows
+    ]
+
+
+def build_company_chat_prompt(company: dict, message: str, job: Optional[dict] = None, kpis: Optional[dict] = None) -> str:
+    job_part = f"\nRelated job posting:\n{job}" if job else ""
+    kpi_part = f"\nCompany KPIs:\n{kpis}" if kpis else ""
+    return f"""
+You are an AI hiring assistant for a company dashboard.
+Help recruiters improve job posts, attract better candidates, understand hiring metrics, and shortlist applicants.
+Be concise, practical, and structured.
+
+{get_company_summary_for_prompt(company)}
+{job_part}
+{kpi_part}
+
+Recruiter question:
+{message}
+""".strip()
+
+
+def build_job_post_analysis_prompt(company: dict, job: dict) -> str:
+    return f"""
+You are an expert recruitment copywriter and hiring analyst.
+Analyze this job post for the company and return a clear structured answer.
+
+{get_company_summary_for_prompt(company)}
+
+Job posting:
+{job}
+
+Return:
+1. Overall quality score out of 100
+2. Clarity problems
+3. Missing sections
+4. Bias or vague wording risks
+5. Improved requirements section
+6. Improved job description
+7. Short action list for the recruiter
+""".strip()
+
+
+def build_candidates_prompt(company: dict, job: dict, candidates: list[dict]) -> str:
+    safe_candidates = []
+    for c in candidates:
+        resume_preview = ""
+        path = c.get("resume_path")
+        if path:
+            try:
+                resume_preview = extract_text(load_resume_bytes(str(path)), str(path))[:1200]
+            except Exception as exc:
+                resume_preview = f"Could not read resume: {exc}"
+        safe_candidates.append({**c, "resume_preview": resume_preview})
+
+    return f"""
+You are an AI recruiter assistant.
+Rank the applicants for this job based on the job requirements and resume previews.
+
+{get_company_summary_for_prompt(company)}
+
+Job posting:
+{job}
+
+Applicants:
+{safe_candidates}
+
+Return a JSON-like structured answer with:
+- ranked_candidates: applicant_id, name, match_score out of 100, strengths, gaps, recommendation
+- overall_notes
+Do not invent information that is not supported by the applicant data.
+""".strip()
+
+# -----------------------------
+# Endpoints
+# -----------------------------
+@app.get("/health")
+def health_check():
+    return {
+        "status": "ok",
+        "model_loaded": MODEL is not None,
+        "index_loaded": INDEX is not None,
+        "jobs_db_exists": os.path.exists(DB_PATH),
+        "index_exists": os.path.exists(INDEX_PATH),
+        "sql_server_configured": all([SQL_SERVER, SQL_DATABASE, SQL_USERNAME, SQL_PASSWORD]),
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "require_remote_resume_url": REQUIRE_REMOTE_RESUME_URL,
+    }
+
+
+@app.get("/health/app-db")
+def app_db_health_check():
+    conn = get_app_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        value = cursor.fetchone()[0]
+        return {"status": "ok", "azure_sql_connection": bool(value)}
+    except pyodbc.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Azure SQL connection failed: {exc}") from exc
+    finally:
+        conn.close()
+
+
+@app.post("/recommend-matches")
+def recommend_matches(req: RecommendRequest):
+    logger.info("Recommendation request user_id=%s limit=%s", req.user_id, req.limit)
+    resume_text = get_resume_text_for_user(req.user_id)
+    jobs = search_hybrid(resume_text, k=req.limit, location=req.location, work_type=req.work_type, experience=req.experience)
+    return {"jobs": [{"job_id": j["job_id"], "title": j["title"], "company": j["company"], "location": j["location"], "work_type": j["work_type"], "experience": j["experience"], "salary_range": j["salary_range"], "similarity_score": j["similarity_score"]} for j in jobs]}
+
+
+@app.post("/analyze-job-id")
+def analyze_job_id(req: AnalyzeJobRequest):
+    logger.info("Analysis request user_id=%s job_id=%s", req.user_id, req.job_id)
+    resume_text = get_resume_text_for_user(req.user_id)
+    conn = get_jobs_db()
+    try:
+        row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (req.job_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job ID not found")
+    return {"analysis": generate_text(build_analysis_prompt(row, resume_text))}
+
+
+@app.post("/search")
+def search_jobs(req: SearchRequest):
+    logger.info("Search request query=%s limit=%s", req.query, req.limit)
+    jobs = search_hybrid(req.query, k=req.limit, location=req.location, work_type=req.work_type, experience=req.experience)
+    return {"jobs": jobs}
+
+
+@app.post("/chat")
+def chat_general(req: ChatRequest):
+    reply = generate_text(f"You are a helpful career coach. Answer clearly and briefly. User message: {req.message}")
+    return {"reply": reply}
+
+
+
+@app.post("/chat/company/message")
+def company_chat(req: CompanyChatRequest):
+    company = ensure_company_context(req.company_user_id, req.company_id)
+    job = get_company_job_posting(company["company_id"], req.job_posting_id) if req.job_posting_id else None
+    kpis = get_company_kpis(company["company_id"], req.job_posting_id)
+    reply = generate_text(build_company_chat_prompt(company, req.message, job=job, kpis=kpis))
+    return {"reply": reply, "company": company, "job": job, "kpis": kpis}
+
+
+@app.post("/chat/company/analyze-company")
+def analyze_company(req: CompanyContextRequest):
+    company = ensure_company_context(req.company_user_id, req.company_id)
+    kpis = get_company_kpis(company["company_id"])
+    prompt = build_company_chat_prompt(
+        company,
+        "Analyze our company profile for hiring attractiveness. Tell us what is strong, what is missing, and how to improve it.",
+        kpis=kpis,
+    )
+    return {"analysis": generate_text(prompt), "company": company, "kpis": kpis}
+
+
+@app.post("/chat/company/analyze-job-post")
+def analyze_company_job_post(req: CompanyJobPostRequest):
+    company = ensure_company_context(req.company_user_id, req.company_id)
+    job = get_company_job_posting(company["company_id"], req.job_posting_id)
+    return {"analysis": generate_text(build_job_post_analysis_prompt(company, job)), "company": company, "job": job}
+
+
+@app.post("/chat/company/hiring-insights")
+def company_hiring_insights(req: CompanyHiringInsightsRequest):
+    company = ensure_company_context(req.company_user_id, req.company_id)
+    kpis = get_company_kpis(company["company_id"], req.job_posting_id)
+    prompt = build_company_chat_prompt(
+        company,
+        "Turn these hiring KPIs into useful recruiter insights. Include risks, bottlenecks, and recommended next actions.",
+        kpis=kpis,
+    )
+    return {"insights": generate_text(prompt), "company": company, "kpis": kpis}
+
+
+@app.post("/chat/company/generate-job-post")
+def generate_company_job_post(req: CompanyGenerateJobPostRequest):
+    company = ensure_company_context(req.company_user_id, req.company_id)
+    prompt = f"""
+You are an expert recruiter and job description writer.
+Create a professional job post for this company.
+
+{get_company_summary_for_prompt(company)}
+
+Role: {req.role}
+Level: {req.level}
+Skills: {req.skills}
+Work type: {req.work_type}
+Location: {req.location}
+Salary range: {req.salary_range}
+
+Return:
+1. Optimized title
+2. Summary
+3. Responsibilities
+4. Requirements
+5. Nice-to-have skills
+6. Benefits / attraction points
+7. Interview screening questions
+""".strip()
+    return {"job_post": generate_text(prompt), "company": company}
+
+
+@app.post("/chat/company/find-candidates")
+def company_find_candidates(req: CompanyFindCandidatesRequest):
+    company = ensure_company_context(req.company_user_id, req.company_id)
+    job = get_company_job_posting(company["company_id"], req.job_posting_id)
+    candidates = get_candidates_for_job(company["company_id"], req.job_posting_id, req.limit)
+    if not candidates:
+        return {"ranking": "No applicants found for this job posting.", "company": company, "job": job, "candidates": []}
+    ranking = generate_text(build_candidates_prompt(company, job, candidates))
+    public_candidates = [{k: v for k, v in c.items() if k != "resume_path"} for c in candidates]
+    return {"ranking": ranking, "company": company, "job": job, "candidates": public_candidates}
+
+@app.post("/clear-cache")
+def clear_cache():
+    get_resume_text_for_user.cache_clear()
+    encode_query_cached.cache_clear()
+    return {"status": "cache cleared"}
