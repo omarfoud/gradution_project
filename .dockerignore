@@ -1,0 +1,46 @@
+# ==========================================
+# Exclude the Frontend UI from Docker Image
+# ==========================================
+index.html
+
+# Exclude Large CSV Datasets & SQLite DBs (Mounted via Docker Compose Volumes)
+*.db
+*.index
+*.csv
+*.docx
+
+# Exclude Git & Local Environments
+.git
+.gitignore
+.env
+.env.local
+.env.example
+.dockerignore
+
+# Exclude Documentation & Dev Scripts
+docs/
+sql/
+DATABASE_SETUP.md
+DEPLOYMENT.md
+README.md
+RELEASE_NOTES.md
+DbConnection.docx
+api.txt
+colmns.py
+test.py
+ingest.py
+
+# Exclude Test Files & Caches
+tests/
+.pytest_cache/
+pytest.ini
+
+# Exclude Python Cache & Virtual Environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+ENV/

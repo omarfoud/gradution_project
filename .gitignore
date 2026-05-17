@@ -71,7 +71,6 @@ job_descriptions.csv
 Resume.csv
 
 # Docker
-.dockerignore
 
 # Node modules (if using frontend build tools)
 node_modules/
