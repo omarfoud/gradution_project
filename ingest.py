@@ -142,6 +142,7 @@ def setup_database() -> None:
             try:
                 job_id = int(float(raw_job_id))
             except ValueError:
+                logger.warning("Skipping row with invalid Job Id: %s", raw_job_id)
                 continue
 
             valid_rows.append(

@@ -1,15 +1,13 @@
+import os
 import pyodbc
+from dotenv import load_dotenv
 
+load_dotenv()
 
-server = 'SQL9001.site4now.net'
-database = 'db_ac91b6_jobify'
-username = 'db_ac91b6_jobify_admin'
-password = 'Test123#'
-
-#server = 'SQL1002.site4now.net'
-#database = 'db_ac9137_noyan6'
-#username = 'db_ac9137_noyan6_admin'
-#password = '[PASSWORD]'
+server = os.getenv("SQL_SERVER", "SQL9001.site4now.net")
+database = os.getenv("SQL_DATABASE", "db_ac91b6_jobify")
+username = os.getenv("SQL_USERNAME", "db_ac91b6_jobify_admin")
+password = os.getenv("SQL_PASSWORD", "")
 
 connection_string = (
     f"DRIVER={{ODBC Driver 18 for SQL Server}};"

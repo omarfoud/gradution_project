@@ -57,6 +57,9 @@ def client(monkeypatch):
     fake_resume_text.cache_clear = lambda: None
     monkeypatch.setattr(main, "get_resume_text_for_user", fake_resume_text)
 
+    # Avoid auth requirement for testing endpoints.
+    monkeypatch.setattr(main, "check_auth", lambda requested_id, auth_header: None)
+
     yield SyncASGIClient(main.app)
 
 
