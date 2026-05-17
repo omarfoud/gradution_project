@@ -303,13 +303,17 @@
             <i class="fas fa-rocket text-muted"></i>
           </div>
           <div class="dashboard-grid" style="gap:15px">
-            <div class="col-6 form-group">
+            <div class="col-4 form-group">
               <label>Company User ID</label>
-              <input id="comp_userId" placeholder="ApplicationUser.Id" />
+              <input id="comp_userId" placeholder="User GUID" />
             </div>
-            <div class="col-6 form-group">
+            <div class="col-4 form-group">
+              <label>OR Company ID</label>
+              <input id="comp_id" placeholder="Company GUID" />
+            </div>
+            <div class="col-4 form-group">
               <label>Job Posting ID</label>
-              <input id="comp_jobId" type="number" placeholder="e.g. 101" />
+              <input id="comp_jobId" placeholder="Job GUID" />
             </div>
           </div>
           <div class="btn-row" style="margin-top: 20px;">
@@ -487,10 +491,11 @@
     // Company Functions
     function getCompCtx() {
       const uid = el('comp_userId').value.trim() || null;
-      return { company_user_id: uid };
+      const cid = el('comp_id').value.trim() || null;
+      return { company_user_id: uid, company_id: cid };
     }
     function getCompJobId() {
-      const v = el('comp_jobId').value.trim(); return v ? Number(v) : null;
+      return el('comp_jobId').value.trim() || null;
     }
 
     async function analyzeCompany() { await apiCall('/chat/company/analyze-company', getCompCtx()); }
