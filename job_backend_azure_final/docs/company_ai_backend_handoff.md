@@ -36,7 +36,7 @@ WHERE UserId = @company_user_id;
 ### Local testing only
 ```json
 {
-  "company_id": 1
+  "company_id": "24BD7844-673D-44BC-95B9-5A61E2E4A76D"
 }
 ```
 
@@ -51,8 +51,8 @@ Request:
 ```json
 {
   "company_user_id": "USER_ID_FROM_LOGIN",
-  "company_id": null,
-  "job_posting_id": 15,
+  "company_id": "24BD7844-673D-44BC-95B9-5A61E2E4A76D",
+  "job_posting_id": "D74BB9CE-C774-4C3E-A0DB-8AC698421CA1",
   "message": "How can we attract better candidates?"
 }
 ```
@@ -88,15 +88,16 @@ Request:
 ```json
 {
   "company_user_id": "USER_ID_FROM_LOGIN",
-  "job_posting_id": 15
+  "company_id": "24BD7844-673D-44BC-95B9-5A61E2E4A76D",
+  "job_posting_id": "D74BB9CE-C774-4C3E-A0DB-8AC698421CA1"
 }
 ```
 
 The endpoint checks that this job belongs to the logged-in company:
 
 ```sql
-SELECT TOP 1 JobID, Title, Description, Requirements, SalaryRange, PostedDate, IsActive, IsRemote, CompanyID, JobType
-FROM JobPosting
+SELECT TOP 1 JobID, Title, Description, Responsibility, MinSalary, MaxSalary, PostedDate, IsActive, IsRemote, CompanyID, JobTypes
+FROM JobPostings
 WHERE JobID = @job_posting_id AND CompanyID = @company_id;
 ```
 
@@ -109,7 +110,8 @@ Request:
 ```json
 {
   "company_user_id": "USER_ID_FROM_LOGIN",
-  "job_posting_id": 15
+  "company_id": "24BD7844-673D-44BC-95B9-5A61E2E4A76D",
+  "job_posting_id": "D74BB9CE-C774-4C3E-A0DB-8AC698421CA1"
 }
 ```
 
@@ -142,10 +144,15 @@ Request:
 ```json
 {
   "company_user_id": "USER_ID_FROM_LOGIN",
-  "job_posting_id": 15,
+  "company_id": "24BD7844-673D-44BC-95B9-5A61E2E4A76D",
+  "job_posting_id": "D74BB9CE-C774-4C3E-A0DB-8AC698421CA1",
   "limit": 10
 }
 ```
+
+Expected test data:
+- `ApplicantID`: `38A90514-B0B7-46F6-AD6C-85A464949564`
+- `ApplicationID`: `BCB68A8E-802A-465F-B736-8178A0CC0971`, `9B24D9B0-2E0C-42E9-A905-A499BC273EA3`
 
 The endpoint reads applications for the job and uses submitted/active resumes:
 
@@ -160,7 +167,7 @@ SELECT TOP @limit
     app.AppliedDate,
     COALESCE(submittedResume.FilePath, activeResume.FilePath) AS ResumePath
 FROM Application app
-JOIN JobPosting jp ON jp.JobID = app.JobPostingID
+JOIN JobPostings jp ON jp.JobID = app.JobPostingID
 JOIN Applicant applicant ON applicant.ApplicantID = app.ApplicantID
 LEFT JOIN Resume submittedResume ON submittedResume.ResumeID = app.ResumeID
 LEFT JOIN Resume activeResume ON activeResume.ApplicantID = applicant.ApplicantID AND activeResume.IsActive = 1
@@ -204,7 +211,7 @@ It includes:
 
 ```sql
 CREATE INDEX IX_Company_UserId ON Company(UserId);
-CREATE INDEX IX_JobPosting_CompanyID_JobID ON JobPosting(CompanyID, JobID);
+CREATE INDEX IX_JobPostings_CompanyID_JobID ON JobPostings(CompanyID, JobID);
 CREATE INDEX IX_Application_JobPostingID_AppliedDate ON Application(JobPostingID, AppliedDate DESC);
 CREATE INDEX IX_Resume_ApplicantID_IsActive_UploadDate ON Resume(ApplicantID, IsActive, UploadDate DESC);
 ```

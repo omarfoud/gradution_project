@@ -123,20 +123,20 @@ class CompanyContextRequest(BaseModel):
     # Send company_user_id after company login. It should be ApplicationUser.Id from the frontend auth/session.
     # company_id can be used for local tests if the frontend does not have the user id yet.
     company_user_id: Optional[str] = None
-    company_id: Optional[int] = None
+    company_id: Optional[str] = None
 
 
 class CompanyChatRequest(CompanyContextRequest):
     message: str = Field(..., min_length=1)
-    job_posting_id: Optional[int] = None
+    job_posting_id: Optional[str] = None
 
 
 class CompanyJobPostRequest(CompanyContextRequest):
-    job_posting_id: int
+    job_posting_id: str
 
 
 class CompanyFindCandidatesRequest(CompanyContextRequest):
-    job_posting_id: int
+    job_posting_id: str
     limit: int = Field(default=10, ge=1, le=25)
 
 
@@ -150,7 +150,7 @@ class CompanyGenerateJobPostRequest(CompanyContextRequest):
 
 
 class CompanyHiringInsightsRequest(CompanyContextRequest):
-    job_posting_id: Optional[int] = None
+    job_posting_id: Optional[str] = None
 
 
 # -----------------------------
@@ -393,7 +393,7 @@ def generate_text(prompt: str) -> str:
 # -----------------------------
 # Company AI helpers
 # -----------------------------
-def ensure_company_context(company_user_id: Optional[str], company_id: Optional[int]) -> dict:
+def ensure_company_context(company_user_id: Optional[str], company_id: Optional[str]) -> dict:
     if not company_user_id and company_id is None:
         raise HTTPException(status_code=400, detail="Send company_user_id from logged-in company session or company_id for local testing")
 
@@ -407,7 +407,7 @@ def ensure_company_context(company_user_id: Optional[str], company_id: Optional[
                 FROM Company
                 WHERE CompanyID = ?
                 """,
-                company_id,
+                str(company_id),
             )
         else:
             cursor.execute(
@@ -439,18 +439,18 @@ def ensure_company_context(company_user_id: Optional[str], company_id: Optional[
     }
 
 
-def get_company_job_posting(company_id: int, job_posting_id: int) -> dict:
+def get_company_job_posting(company_id: str, job_posting_id: str) -> dict:
     conn = get_app_db()
     try:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT TOP 1 JobID, Title, Description, Requirements, SalaryRange, PostedDate, IsActive, IsRemote, CompanyID, JobType
-            FROM JobPosting
+            SELECT TOP 1 JobID, Title, Description, Responsibility, MinSalary, MaxSalary, PostedDate, IsActive, IsRemote, CompanyID, JobTypes
+            FROM JobPostings
             WHERE JobID = ? AND CompanyID = ?
             """,
-            job_posting_id,
-            company_id,
+            str(job_posting_id),
+            str(company_id),
         )
         row = cursor.fetchone()
     except pyodbc.Error as exc:
@@ -461,17 +461,25 @@ def get_company_job_posting(company_id: int, job_posting_id: int) -> dict:
     if not row:
         raise HTTPException(status_code=404, detail="Job posting not found for this company")
 
+    salary_range = "Negotiable"
+    if row[4] is not None and row[5] is not None:
+        salary_range = f"{float(row[4]):.2f} - {float(row[5]):.2f}"
+    elif row[4] is not None:
+        salary_range = f"{float(row[4]):.2f}+"
+    elif row[5] is not None:
+        salary_range = f"Up to {float(row[5]):.2f}"
+
     return {
-        "job_id": row[0],
+        "job_id": str(row[0]),
         "title": row[1],
         "description": row[2],
-        "requirements": row[3],
-        "salary_range": row[4],
-        "posted_date": str(row[5]) if row[5] else None,
-        "is_active": bool(row[6]),
-        "is_remote": bool(row[7]),
-        "company_id": row[8],
-        "job_type": str(row[9]) if row[9] is not None else None,
+        "responsibilities": row[3],
+        "salary_range": salary_range,
+        "posted_date": str(row[6]) if row[6] else None,
+        "is_active": bool(row[7]),
+        "is_remote": bool(row[8]),
+        "company_id": str(row[9]),
+        "job_type": str(row[10]) if row[10] is not None else None,
     }
 
 
@@ -487,7 +495,7 @@ Company:
 """.strip()
 
 
-def get_company_kpis(company_id: int, job_posting_id: Optional[int] = None) -> dict:
+def get_company_kpis(company_id: str, job_posting_id: Optional[str] = None) -> dict:
     conn = get_app_db()
     try:
         cursor = conn.cursor()
@@ -496,11 +504,11 @@ def get_company_kpis(company_id: int, job_posting_id: Optional[int] = None) -> d
                 """
                 SELECT COUNT(*)
                 FROM Application a
-                JOIN JobPosting jp ON jp.JobID = a.JobPostingID
+                JOIN JobPostings jp ON jp.JobID = a.JobPostingID
                 WHERE jp.CompanyID = ? AND jp.JobID = ?
                 """,
-                company_id,
-                job_posting_id,
+                str(company_id),
+                str(job_posting_id),
             )
             applications_count = int(cursor.fetchone()[0])
 
@@ -508,23 +516,23 @@ def get_company_kpis(company_id: int, job_posting_id: Optional[int] = None) -> d
                 """
                 SELECT TOP 10 CAST(a.ApplicationStatus AS NVARCHAR(100)) AS StatusName, COUNT(*) AS Total
                 FROM Application a
-                JOIN JobPosting jp ON jp.JobID = a.JobPostingID
+                JOIN JobPostings jp ON jp.JobID = a.JobPostingID
                 WHERE jp.CompanyID = ? AND jp.JobID = ?
                 GROUP BY CAST(a.ApplicationStatus AS NVARCHAR(100))
                 ORDER BY Total DESC
                 """,
-                company_id,
-                job_posting_id,
+                str(company_id),
+                str(job_posting_id),
             )
         else:
             cursor.execute(
                 """
                 SELECT COUNT(*)
                 FROM Application a
-                JOIN JobPosting jp ON jp.JobID = a.JobPostingID
+                JOIN JobPostings jp ON jp.JobID = a.JobPostingID
                 WHERE jp.CompanyID = ?
                 """,
-                company_id,
+                str(company_id),
             )
             applications_count = int(cursor.fetchone()[0])
 
@@ -532,27 +540,27 @@ def get_company_kpis(company_id: int, job_posting_id: Optional[int] = None) -> d
                 """
                 SELECT TOP 10 CAST(a.ApplicationStatus AS NVARCHAR(100)) AS StatusName, COUNT(*) AS Total
                 FROM Application a
-                JOIN JobPosting jp ON jp.JobID = a.JobPostingID
+                JOIN JobPostings jp ON jp.JobID = a.JobPostingID
                 WHERE jp.CompanyID = ?
                 GROUP BY CAST(a.ApplicationStatus AS NVARCHAR(100))
                 ORDER BY Total DESC
                 """,
-                company_id,
+                str(company_id),
             )
         status_breakdown = [{"status": str(r[0]), "count": int(r[1])} for r in cursor.fetchall()]
 
         cursor.execute(
             """
             SELECT TOP 10 jp.JobID, jp.Title, COUNT(a.ApplicationID) AS ApplicationCount
-            FROM JobPosting jp
+            FROM JobPostings jp
             LEFT JOIN Application a ON a.JobPostingID = jp.JobID
             WHERE jp.CompanyID = ?
             GROUP BY jp.JobID, jp.Title
             ORDER BY ApplicationCount DESC
             """,
-            company_id,
+            str(company_id),
         )
-        top_jobs = [{"job_id": r[0], "title": r[1], "application_count": int(r[2])} for r in cursor.fetchall()]
+        top_jobs = [{"job_id": str(r[0]), "title": r[1], "application_count": int(r[2])} for r in cursor.fetchall()]
     except pyodbc.Error as exc:
         raise HTTPException(status_code=500, detail=f"Company KPI query failed: {exc}") from exc
     finally:
@@ -561,7 +569,7 @@ def get_company_kpis(company_id: int, job_posting_id: Optional[int] = None) -> d
     return {"applications_count": applications_count, "status_breakdown": status_breakdown, "top_jobs": top_jobs}
 
 
-def get_candidates_for_job(company_id: int, job_posting_id: int, limit: int) -> list[dict]:
+def get_candidates_for_job(company_id: str, job_posting_id: str, limit: int) -> list[dict]:
     # Keep TOP value controlled by Pydantic limit to avoid SQL injection.
     limit = max(1, min(int(limit), 25))
     conn = get_app_db()
@@ -579,15 +587,15 @@ def get_candidates_for_job(company_id: int, job_posting_id: int, limit: int) -> 
                 app.AppliedDate,
                 COALESCE(submittedResume.FilePath, activeResume.FilePath) AS ResumePath
             FROM Application app
-            JOIN JobPosting jp ON jp.JobID = app.JobPostingID
+            JOIN JobPostings jp ON jp.JobID = app.JobPostingID
             JOIN Applicant applicant ON applicant.ApplicantID = app.ApplicantID
             LEFT JOIN Resume submittedResume ON submittedResume.ResumeID = app.ResumeID
             LEFT JOIN Resume activeResume ON activeResume.ApplicantID = applicant.ApplicantID AND activeResume.IsActive = 1
             WHERE jp.CompanyID = ? AND jp.JobID = ?
             ORDER BY app.AppliedDate DESC
             """,
-            company_id,
-            job_posting_id,
+            str(company_id),
+            str(job_posting_id),
         )
         rows = cursor.fetchall()
     except pyodbc.Error as exc:
@@ -597,8 +605,8 @@ def get_candidates_for_job(company_id: int, job_posting_id: int, limit: int) -> 
 
     return [
         {
-            "application_id": r[0],
-            "applicant_id": r[1],
+            "application_id": str(r[0]),
+            "applicant_id": str(r[1]),
             "name": f"{r[2] or ''} {r[3] or ''}".strip(),
             "location": r[4],
             "application_status": str(r[5]) if r[5] is not None else None,
@@ -641,7 +649,7 @@ Return:
 2. Clarity problems
 3. Missing sections
 4. Bias or vague wording risks
-5. Improved requirements section
+5. Improved qualifications section
 6. Improved job description
 7. Short action list for the recruiter
 """.strip()
@@ -661,7 +669,7 @@ def build_candidates_prompt(company: dict, job: dict, candidates: list[dict]) ->
 
     return f"""
 You are an AI recruiter assistant.
-Rank the applicants for this job based on the job requirements and resume previews.
+Rank the applicants for this job based on the job responsibilities and resume previews.
 
 {get_company_summary_for_prompt(company)}
 
@@ -804,7 +812,7 @@ Return:
 1. Optimized title
 2. Summary
 3. Responsibilities
-4. Requirements
+4. Qualifications
 5. Nice-to-have skills
 6. Benefits / attraction points
 7. Interview screening questions

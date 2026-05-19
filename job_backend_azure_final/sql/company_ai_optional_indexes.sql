@@ -5,7 +5,7 @@
 CREATE INDEX IX_Company_UserId ON Company(UserId);
 
 -- 2) Verify that a job belongs to the logged-in company
-CREATE INDEX IX_JobPosting_CompanyID_JobID ON JobPosting(CompanyID, JobID);
+CREATE INDEX IX_JobPostings_CompanyID_JobID ON JobPostings(CompanyID, JobID);
 
 -- 3) Read applications for a job quickly
 CREATE INDEX IX_Application_JobPostingID_AppliedDate ON Application(JobPostingID, AppliedDate DESC);

@@ -719,7 +719,7 @@ Return:
 2. Clarity problems
 3. Missing sections
 4. Bias or vague wording risks
-5. Improved requirements section
+5. Improved qualifications section
 6. Improved job description
 7. Short action list for the recruiter
 """.strip()
@@ -914,7 +914,7 @@ Return:
 1. Optimized title
 2. Summary
 3. Responsibilities
-4. Requirements
+4. Qualifications
 5. Nice-to-have skills
 6. Benefits / attraction points
 7. Interview screening questions
