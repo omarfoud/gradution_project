@@ -3,10 +3,12 @@
 # ==========================================
 index.html
 
-# Exclude Large CSV Datasets & SQLite DBs (Mounted via Docker Compose Volumes)
+# Exclude large datasets by default, but keep local search artifacts in the Docker image.
 *.db
 *.index
 *.csv
+!jobs.db
+!jobs.index
 *.docx
 
 # Exclude Git & Local Environments
@@ -32,6 +34,7 @@ ingest.py
 
 # Exclude Test Files & Caches
 tests/
+temp/
 .pytest_cache/
 pytest.ini
 

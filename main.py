@@ -88,20 +88,20 @@ else:
 async def lifespan(app: FastAPI):
     global MODEL, INDEX
 
-    # Use os.path.isfile to avoid empty directories created by Docker volumes
+    try:
+        logger.info("Loading embedding model: %s on %s", MODEL_NAME, DEVICE)
+        MODEL = SentenceTransformer(MODEL_NAME, device=DEVICE)
+    except Exception as exc:
+        logger.error("FAILED to load embedding model '%s': %s", MODEL_NAME, exc, exc_info=True)
+        MODEL = None
+
+    # Use os.path.isfile to avoid empty directories created by Docker volumes.
     if not os.path.isfile(DB_PATH) or not os.path.isfile(INDEX_PATH):
         logger.warning(
             "jobs.db or jobs.index not found (or are empty directories created by Docker volumes). "
-            "Applicant matching/search endpoints will return 503 until you run: python ingest.py"
+            "Local FAISS search will be skipped until you run: python ingest.py"
         )
     else:
-        try:
-            logger.info("Loading embedding model: %s on %s", MODEL_NAME, DEVICE)
-            MODEL = SentenceTransformer(MODEL_NAME, device=DEVICE)
-        except Exception as exc:
-            logger.error("FAILED to load embedding model '%s': %s", MODEL_NAME, exc, exc_info=True)
-            MODEL = None
-
         try:
             logger.info("Loading FAISS index: %s", INDEX_PATH)
             INDEX = faiss.read_index(INDEX_PATH)
@@ -377,8 +377,8 @@ def fetch_jobs_by_faiss_ids(conn: sqlite3.Connection, faiss_ids: list[int], filt
 
 
 def search_hybrid(query_text: str, *, k: int = RESULTS_LIMIT, location: Optional[str] = None, work_type: Optional[str] = None, experience: Optional[str] = None):
-    if INDEX is None:
-        raise HTTPException(status_code=503, detail="FAISS index is not loaded yet. Run python ingest.py to create jobs.db and jobs.index.")
+    if MODEL is None or INDEX is None:
+        raise HTTPException(status_code=503, detail="FAISS search is not loaded yet. Run python ingest.py to create jobs.db and jobs.index.")
     if not os.path.exists(DB_PATH):
         raise HTTPException(status_code=503, detail="jobs.db is missing. Run python ingest.py.")
 
@@ -409,6 +409,7 @@ def search_hybrid(query_text: str, *, k: int = RESULTS_LIMIT, location: Optional
             continue
         item = dict(row)
         item["similarity_score"] = round(score_by_id.get(row["faiss_id"], 0.0), 4)
+        item["embedding_source"] = "faiss_local"
         results.append(item)
         seen.add(job_id)
         if len(results) >= k:

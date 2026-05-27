@@ -5,7 +5,7 @@ This version is prepared for integration with the graduation project's hosted SQ
 ## What this version includes
 
 - FastAPI backend for job recommendation and analysis.
-- FAISS + SQLite hybrid search over `job_descriptions.csv`.
+- Local FAISS + SQLite search over `job_descriptions.csv`.
 - Hosted SQL Server integration through `pyodbc`.
 - Active CV retrieval by `user_id` from the project database.
 - PDF/DOCX CV text extraction.
@@ -37,13 +37,19 @@ See:
 1. Copy `.env.example` to `.env`.
 2. Fill SQL Server credentials.
 3. Put `job_descriptions.csv` in the project root.
-4. Run ingestion:
+4. Run the required SQL script on the hosted database:
+
+```bash
+sql/backend_required_changes.sql
+```
+
+5. Run ingestion:
 
 ```bash
 python ingest.py
 ```
 
-5. Start the API:
+6. Start the API:
 
 ```bash
 docker compose up --build
@@ -70,6 +76,18 @@ GET /health/app-db
 
 `Resume.FilePath` should be an HTTP/HTTPS URL to a reachable PDF or DOCX file.
 Local Windows paths like `C:\Users\...` will not work in Docker/cloud production.
+
+`/search` and `/recommend-matches` use the bundled local `jobs.index` and `jobs.db` files. This is the Docker image deployment mode.
+
+## Docker image search files
+
+This deployment bundles the local search artifacts into the Docker image:
+
+- `jobs.db`
+- `jobs.index`
+
+The container reads `/app/jobs.db` and `/app/jobs.index` directly from the image, so Docker Compose no longer needs to mount those files as volumes.
+These files are intentionally not stored in Git because they are too large for normal GitHub pushes. Keep them in the project root before running `docker compose build`.
 
 ## Do not commit
 

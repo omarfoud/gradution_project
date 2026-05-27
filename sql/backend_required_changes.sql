@@ -3,23 +3,44 @@ Backend required SQL changes for Azure SQL Database.
 Run this on the main application database before connecting the AI backend.
 */
 
--- 1) Add active resume flag if it does not exist
-IF COL_LENGTH('Resume', 'IsActive') IS NULL
+-- 1) Add active resume flag if it does not exist.
+-- Supports both ERD-style singular names and the deployed plural table names.
+DECLARE @ResumeTable SYSNAME = CASE
+    WHEN OBJECT_ID(N'dbo.Resume', N'U') IS NOT NULL THEN N'dbo.Resume'
+    WHEN OBJECT_ID(N'dbo.Resumes', N'U') IS NOT NULL THEN N'dbo.Resumes'
+    ELSE NULL
+END;
+
+IF @ResumeTable IS NOT NULL AND COL_LENGTH(@ResumeTable, 'IsActive') IS NULL
 BEGIN
-    ALTER TABLE Resume ADD IsActive BIT NOT NULL CONSTRAINT DF_Resume_IsActive DEFAULT 0;
+    DECLARE @AddIsActiveSql NVARCHAR(MAX) =
+        N'ALTER TABLE ' + @ResumeTable + N' ADD IsActive BIT NOT NULL CONSTRAINT DF_' +
+        REPLACE(REPLACE(@ResumeTable, N'dbo.', N''), N']', N'') + N'_IsActive DEFAULT 0;';
+    EXEC sp_executesql @AddIsActiveSql;
 END;
 GO
 
 -- 2) Recommended index for fast active CV lookup
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'idx_resume_active'
-      AND object_id = OBJECT_ID('Resume')
-)
+DECLARE @ResumeTableForIndex SYSNAME = CASE
+    WHEN OBJECT_ID(N'dbo.Resume', N'U') IS NOT NULL THEN N'dbo.Resume'
+    WHEN OBJECT_ID(N'dbo.Resumes', N'U') IS NOT NULL THEN N'dbo.Resumes'
+    ELSE NULL
+END;
+
+IF @ResumeTableForIndex IS NOT NULL
+   AND COL_LENGTH(@ResumeTableForIndex, 'ApplicantID') IS NOT NULL
+   AND COL_LENGTH(@ResumeTableForIndex, 'IsActive') IS NOT NULL
+   AND COL_LENGTH(@ResumeTableForIndex, 'UploadDate') IS NOT NULL
+   AND NOT EXISTS (
+        SELECT 1
+        FROM sys.indexes
+        WHERE name = 'idx_resume_active'
+          AND object_id = OBJECT_ID(@ResumeTableForIndex)
+   )
 BEGIN
-    CREATE INDEX idx_resume_active
-    ON Resume(ApplicantID, IsActive, UploadDate DESC);
+    DECLARE @CreateResumeIndexSql NVARCHAR(MAX) =
+        N'CREATE INDEX idx_resume_active ON ' + @ResumeTableForIndex + N'(ApplicantID, IsActive, UploadDate DESC);';
+    EXEC sp_executesql @CreateResumeIndexSql;
 END;
 GO
 
@@ -48,3 +69,4 @@ JOIN Resume r ON r.ApplicantID = a.ApplicantID
 WHERE a.UserId = @UserId AND r.IsActive = 1
 ORDER BY r.UploadDate DESC;
 */
+GO

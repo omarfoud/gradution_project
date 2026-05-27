@@ -5,7 +5,9 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    CUDA_VISIBLE_DEVICES=""
+    CUDA_VISIBLE_DEVICES="" \
+    DB_PATH=/app/jobs.db \
+    INDEX_PATH=/app/jobs.index
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -24,7 +26,9 @@ RUN curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /u
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.3.1 && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 

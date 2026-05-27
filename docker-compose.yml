@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   ai-job-backend:
     build: .
@@ -16,10 +14,6 @@ services:
       DEVICE: cpu
       SQL_PORT: 1433
       SQL_DRIVER: ODBC Driver 18 for SQL Server
-    volumes:
-      - ./jobs.db:/app/jobs.db
-      - ./jobs.index:/app/jobs.index
-      - ./job_descriptions.csv:/app/job_descriptions.csv:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
