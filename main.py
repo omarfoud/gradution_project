@@ -639,12 +639,18 @@ def get_company_kpis(company_id: str, job_posting_id: Optional[str] = None) -> d
     return {"applications_count": applications_count, "status_breakdown": status_breakdown, "top_jobs": top_jobs}
 
 
+def sql_column_exists(cursor, table_name: str, column_name: str) -> bool:
+    cursor.execute("SELECT COL_LENGTH(?, ?)", table_name, column_name)
+    return cursor.fetchone()[0] is not None
+
+
 def get_candidates_for_job(company_id: str, job_posting_id: str, limit: int) -> list[dict]:
     # Keep TOP value controlled by Pydantic limit to avoid SQL injection.
     limit = max(1, min(int(limit), 25))
     conn = get_app_db()
     try:
         cursor = conn.cursor()
+        match_score_expr = "app.MatchScore" if sql_column_exists(cursor, APPLICATION_TABLE, "MatchScore") else "CAST(NULL AS INT)"
         cursor.execute(
             f"""
             SELECT TOP (?)
@@ -655,7 +661,8 @@ def get_candidates_for_job(company_id: str, job_posting_id: str, limit: int) -> 
                 applicant.Location,
                 app.ApplicationStatus,
                 app.AppliedDate,
-                COALESCE(submittedResume.FilePath, activeResume.FilePath) AS ResumePath
+                COALESCE(submittedResume.FilePath, activeResume.FilePath) AS ResumePath,
+                {match_score_expr} AS MatchScore
             FROM {APPLICATION_TABLE} app
             JOIN {JOB_POSTING_TABLE} jp ON jp.JobID = app.JobPostingID
             JOIN {APPLICANT_TABLE} applicant ON applicant.ApplicantID = app.ApplicantID
@@ -683,9 +690,124 @@ def get_candidates_for_job(company_id: str, job_posting_id: str, limit: int) -> 
             "application_status": str(r[5]) if r[5] is not None else None,
             "applied_date": str(r[6]) if r[6] else None,
             "resume_path": r[7],
+            "match_score": int(r[8]) if r[8] is not None else None,
         }
         for r in rows
     ]
+
+
+def build_job_match_text(job: dict) -> str:
+    return " ".join(
+        str(value or "")
+        for value in [
+            job.get("title"),
+            job.get("description"),
+            job.get("responsibilities"),
+            job.get("job_type"),
+            job.get("salary_range"),
+        ]
+    ).strip()
+
+
+def keyword_match_score(job_text: str, resume_text: str) -> int:
+    job_terms = {
+        term.lower()
+        for term in re.findall(r"[A-Za-z][A-Za-z+#.\-]{1,}|[\u0600-\u06FF]{2,}", job_text)
+        if len(term) >= 2
+    }
+    resume_terms = {
+        term.lower()
+        for term in re.findall(r"[A-Za-z][A-Za-z+#.\-]{1,}|[\u0600-\u06FF]{2,}", resume_text)
+        if len(term) >= 2
+    }
+    if not job_terms or not resume_terms:
+        return 0
+
+    overlap = len(job_terms & resume_terms)
+    coverage = overlap / len(job_terms)
+    precision = overlap / len(resume_terms)
+    score = (coverage * 0.8) + (precision * 0.2)
+    return max(0, min(100, round(score * 100)))
+
+
+def calculate_cv_match_score(job_text: str, resume_text: str) -> int:
+    job_text = (job_text or "").strip()
+    resume_text = (resume_text or "").strip()
+    if not job_text or not resume_text or resume_text.startswith(("Could not read resume:", "Failed to fetch resume:")):
+        return 0
+
+    if MODEL is None:
+        return keyword_match_score(job_text, resume_text)
+
+    try:
+        embeddings = MODEL.encode([job_text, resume_text], convert_to_numpy=True).astype("float32")
+        faiss.normalize_L2(embeddings)
+        similarity = float(embeddings[0] @ embeddings[1])
+        return max(0, min(100, round(similarity * 100)))
+    except Exception as exc:
+        logger.warning("Embedding match score failed, using keyword fallback: %s", exc)
+        return keyword_match_score(job_text, resume_text)
+
+
+def add_resume_previews_and_match_scores(job: dict, candidates: list[dict]) -> list[dict]:
+    job_text = build_job_match_text(job)
+
+    def enrich_candidate(candidate: dict) -> dict:
+        resume_preview = ""
+        path = candidate.get("resume_path")
+        if path:
+            try:
+                resume_preview = extract_text(load_resume_bytes(str(path)), str(path))[:2200]
+            except Exception as exc:
+                resume_preview = f"Could not read resume: {exc}"
+
+        computed_score = calculate_cv_match_score(job_text, resume_preview)
+        return {
+            **candidate,
+            "resume_preview": resume_preview,
+            "match_score": computed_score,
+        }
+
+    max_workers = min(len(candidates), 10) if candidates else 1
+    enriched_candidates = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(enrich_candidate, candidate) for candidate in candidates]
+        concurrent.futures.wait(futures, timeout=20.0)
+
+        for future, candidate in zip(futures, candidates):
+            if future.done():
+                try:
+                    enriched_candidates.append(future.result())
+                except Exception as exc:
+                    enriched_candidates.append({**candidate, "resume_preview": f"Failed to fetch resume: {exc}", "match_score": 0})
+            else:
+                enriched_candidates.append({**candidate, "resume_preview": "Failed to fetch resume: Request timed out", "match_score": 0})
+
+    return sorted(enriched_candidates, key=lambda item: item.get("match_score") or 0, reverse=True)
+
+
+def save_candidate_match_scores(candidates: list[dict]) -> None:
+    if not candidates:
+        return
+
+    conn = get_app_db()
+    try:
+        cursor = conn.cursor()
+        if not sql_column_exists(cursor, APPLICATION_TABLE, "MatchScore"):
+            return
+
+        for candidate in candidates:
+            cursor.execute(
+                f"UPDATE {APPLICATION_TABLE} SET MatchScore = ? WHERE ApplicationID = ?",
+                int(candidate.get("match_score") or 0),
+                candidate.get("application_id"),
+            )
+        conn.commit()
+    except pyodbc.Error as exc:
+        logger.warning("Failed to save candidate MatchScore values: %s", exc)
+    finally:
+        conn.close()
 
 
 def build_company_chat_prompt(company: dict, message: str, job: Optional[dict] = None, kpis: Optional[dict] = None) -> str:
@@ -727,35 +849,9 @@ Return:
 
 
 def build_candidates_prompt(company: dict, job: dict, candidates: list[dict]) -> str:
-    def fetch_resume_preview(c: dict) -> dict:
-        resume_preview = ""
-        path = c.get("resume_path")
-        if path:
-            try:
-                resume_preview = extract_text(load_resume_bytes(str(path)), str(path))[:1200]
-            except Exception as exc:
-                resume_preview = f"Could not read resume: {exc}"
-        return {**c, "resume_preview": resume_preview}
-
-    max_workers = min(len(candidates), 10) if candidates else 1
-    safe_candidates = []
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(fetch_resume_preview, c) for c in candidates]
-        concurrent.futures.wait(futures, timeout=15.0)
-        
-        for future, c in zip(futures, candidates):
-            if future.done():
-                try:
-                    safe_candidates.append(future.result())
-                except Exception as exc:
-                    safe_candidates.append({**c, "resume_preview": f"Failed to fetch resume: {exc}"})
-            else:
-                safe_candidates.append({**c, "resume_preview": "Failed to fetch resume: Request timed out"})
-
     return f"""
 You are an AI recruiter assistant.
-Rank the applicants for this job based on the job responsibilities and resume previews.
+Explain the applicant ranking for this job based on the job requirements, resume previews, and computed match_score values.
 
 {get_company_summary_for_prompt(company)}
 
@@ -763,12 +859,12 @@ Job posting:
 {job}
 
 Applicants:
-{safe_candidates}
+{candidates}
 
 Return a JSON-like structured answer with:
 - ranked_candidates: applicant_id, name, match_score out of 100, strengths, gaps, recommendation
 - overall_notes
-Do not invent information that is not supported by the applicant data.
+Do not change the provided match_score values. Do not invent information that is not supported by the applicant data.
 """.strip()
 
 # -----------------------------
@@ -931,8 +1027,13 @@ def company_find_candidates(req: CompanyFindCandidatesRequest, authorization: Op
     candidates = get_candidates_for_job(company["company_id"], req.job_posting_id, req.limit)
     if not candidates:
         return {"ranking": "No applicants found for this job posting.", "company": company, "job": job, "candidates": []}
-    ranking = generate_text(build_candidates_prompt(company, job, candidates))
-    public_candidates = [{k: v for k, v in c.items() if k != "resume_path"} for c in candidates]
+    scored_candidates = add_resume_previews_and_match_scores(job, candidates)
+    save_candidate_match_scores(scored_candidates)
+    ranking = generate_text(build_candidates_prompt(company, job, scored_candidates))
+    public_candidates = [
+        {k: v for k, v in candidate.items() if k not in {"resume_path", "resume_preview"}}
+        for candidate in scored_candidates
+    ]
     return {"ranking": ranking, "company": company, "job": job, "candidates": public_candidates}
 
 

@@ -1,6 +1,8 @@
 services:
   ai-job-backend:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: ai-job-backend
     ports:
       - "8000:8000"

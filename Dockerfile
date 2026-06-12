@@ -32,6 +32,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY . .
 
+RUN test -f /app/jobs.db && test -f /app/jobs.index
+
 EXPOSE 8000
 
 CMD ["python", "entrypoint.py"]

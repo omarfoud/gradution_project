@@ -70,3 +70,20 @@ WHERE a.UserId = @UserId AND r.IsActive = 1
 ORDER BY r.UploadDate DESC;
 */
 GO
+
+-- 5) Add candidate match score to applications if it does not exist.
+-- This maps to the .NET property: public int MatchScore { get; set; }
+DECLARE @ApplicationTable SYSNAME = CASE
+    WHEN OBJECT_ID(N'dbo.Application', N'U') IS NOT NULL THEN N'dbo.Application'
+    WHEN OBJECT_ID(N'dbo.Applications', N'U') IS NOT NULL THEN N'dbo.Applications'
+    ELSE NULL
+END;
+
+IF @ApplicationTable IS NOT NULL AND COL_LENGTH(@ApplicationTable, 'MatchScore') IS NULL
+BEGIN
+    DECLARE @AddMatchScoreSql NVARCHAR(MAX) =
+        N'ALTER TABLE ' + @ApplicationTable + N' ADD MatchScore INT NOT NULL CONSTRAINT DF_' +
+        REPLACE(REPLACE(@ApplicationTable, N'dbo.', N''), N']', N'') + N'_MatchScore DEFAULT 0;';
+    EXEC sp_executesql @AddMatchScoreSql;
+END;
+GO

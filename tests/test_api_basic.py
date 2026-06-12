@@ -120,3 +120,13 @@ def test_recommend_matches_returns_summary_fields(client):
         "salary_range",
         "similarity_score",
     }
+
+
+def test_keyword_match_score_prefers_relevant_resume(monkeypatch):
+    monkeypatch.setattr(main, "MODEL", None)
+
+    job_text = "Python machine learning data preprocessing model evaluation"
+    relevant_resume = "Python developer with machine learning, data preprocessing, and model evaluation experience"
+    unrelated_resume = "Sales manager with customer service and retail operations experience"
+
+    assert main.calculate_cv_match_score(job_text, relevant_resume) > main.calculate_cv_match_score(job_text, unrelated_resume)
