@@ -16,10 +16,18 @@ services:
       DEVICE: cpu
       SQL_PORT: 1433
       SQL_DRIVER: ODBC Driver 18 for SQL Server
+    # -----------------------------------------------------------------------
+    # LOCAL DEVELOPMENT ONLY: mount pre-built index files as volumes.
+    # In production, set ARTIFACTS_URL_DB and ARTIFACTS_URL_INDEX in .env
+    # and the container will download them from Azure Blob Storage on startup.
+    # -----------------------------------------------------------------------
+    # volumes:
+    #   - ./jobs.db:/app/jobs.db
+    #   - ./jobs.index:/app/jobs.index
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 60s

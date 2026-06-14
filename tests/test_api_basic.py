@@ -1,65 +1,97 @@
 import asyncio
-
 import httpx
 import pytest
+import sys
+import types
 
+# ---- Stub heavy dependencies that need real hardware ----
+# Stub sentence_transformers
+st_mod = types.ModuleType("sentence_transformers")
+class FakeST:
+    def __init__(self, *a, **kw): pass
+    def encode(self, texts, **kw):
+        import numpy as np
+        return np.ones((len(texts), 384), dtype="float32")
+    def get_sentence_embedding_dimension(self): return 384
+st_mod.SentenceTransformer = FakeST
+sys.modules["sentence_transformers"] = st_mod
+
+# Stub faiss
+faiss_mod = types.ModuleType("faiss")
+class FakeIndex:
+    ntotal = 100
+    nprobe = 20
+    d = 384
+    def search(self, v, k):
+        import numpy as np
+        return np.ones((1,k), dtype="float32"), np.arange(k, dtype="int64").reshape(1,k)
+faiss_mod.IndexFlatIP = FakeIndex
+faiss_mod.IndexIVFFlat = FakeIndex
+faiss_mod.METRIC_INNER_PRODUCT = 0
+faiss_mod.normalize_L2 = lambda x: None
+faiss_mod.read_index = lambda path: FakeIndex()
+faiss_mod.write_index = lambda idx, path: None
+sys.modules["faiss"] = faiss_mod
+
+# Stub google.generativeai
+genai_mod = types.ModuleType("google.generativeai")
+google_mod = types.ModuleType("google")
+google_mod.generativeai = genai_mod
+genai_mod.configure = lambda **kw: None
+class FakeModel:
+    def generate_content(self, prompt): 
+        class R: text = "ok"
+        return R()
+genai_mod.GenerativeModel = lambda name: FakeModel()
+sys.modules["google"] = google_mod
+sys.modules["google.generativeai"] = genai_mod
+
+# Stub pyodbc
+pyodbc_mod = types.ModuleType("pyodbc")
+class PyodbcError(Exception): pass
+pyodbc_mod.Error = PyodbcError
+pyodbc_mod.connect = lambda *a, **kw: (_ for _ in ()).throw(PyodbcError("no real db"))
+sys.modules["pyodbc"] = pyodbc_mod
+
+# Stub jwt
+jwt_mod = types.ModuleType("jwt")
+class JWTError(Exception): pass
+jwt_mod.PyJWTError = JWTError
+jwt_mod.decode = lambda token, secret, algorithms: {"sub": "user1"}
+sys.modules["jwt"] = jwt_mod
+
+# Now safe to import main
 import main
-
 
 class SyncASGIClient:
     def __init__(self, app):
         self.app = app
-
     def get(self, url, **kwargs):
         return asyncio.run(self._request("GET", url, **kwargs))
-
     def post(self, url, **kwargs):
         return asyncio.run(self._request("POST", url, **kwargs))
-
     async def _request(self, method, url, **kwargs):
         transport = httpx.ASGITransport(app=self.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             return await client.request(method, url, **kwargs)
 
-
 @pytest.fixture()
 def client(monkeypatch):
-    # Avoid calling external services.
     monkeypatch.setattr(main, "generate_text", lambda prompt: "ok")
-
-    # Avoid FAISS/SQLite dependency for endpoint tests.
     monkeypatch.setattr(
-        main,
-        "search_hybrid",
-        lambda query_text, **kwargs: [
-            {
-                "job_id": 1,
-                "faiss_id": 0,
-                "title": "Data Scientist",
-                "company": "ACME",
-                "description": "",
-                "qualifications": "",
-                "responsibilities": "",
-                "skills": "python",
-                "experience": "junior",
-                "location": "Cairo",
-                "work_type": "remote",
-                "salary_range": "",
-                "similarity_score": 0.9,
-            }
-        ],
+        main, "search_hybrid",
+        lambda query_text, **kwargs: [{
+            "job_id": 1, "faiss_id": 0, "title": "Data Scientist", "company": "ACME",
+            "description": "", "qualifications": "", "responsibilities": "",
+            "skills": "python", "experience": "junior", "location": "Cairo",
+            "work_type": "remote", "salary_range": "", "similarity_score": 0.9,
+        }],
     )
-
-    # Avoid Azure SQL resume lookup; keep it deterministic.
     def fake_resume_text(user_id):
         return "my resume"
-
     fake_resume_text.cache_clear = lambda: None
     monkeypatch.setattr(main, "get_resume_text_for_user", fake_resume_text)
-
-    # Avoid auth requirement for testing endpoints.
     monkeypatch.setattr(main, "check_auth", lambda requested_id, auth_header: None)
-
     yield SyncASGIClient(main.app)
 
 
@@ -99,34 +131,59 @@ def test_chat_returns_reply(client):
 def test_recommend_matches_returns_summary_fields(client):
     res = client.post(
         "/recommend-matches",
-        json={
-            "user_id": "user-1",
-            "location": None,
-            "work_type": None,
-            "experience": None,
-            "limit": 5,
-        },
+        json={"user_id": "user-1", "location": None, "work_type": None, "experience": None, "limit": 5},
     )
     assert res.status_code == 200
     jobs = res.json()["jobs"]
     assert len(jobs) == 1
     assert set(jobs[0].keys()) == {
-        "job_id",
-        "title",
-        "company",
-        "location",
-        "work_type",
-        "experience",
-        "salary_range",
-        "similarity_score",
+        "job_id", "title", "company", "location", "work_type",
+        "experience", "salary_range", "similarity_score",
     }
 
 
-def test_keyword_match_score_prefers_relevant_resume(monkeypatch):
+def test_search_empty_query_rejected(client):
+    res = client.post("/search", json={"query": "", "limit": 5})
+    assert res.status_code == 422
+
+
+def test_recommend_empty_user_id_rejected(client):
+    res = client.post("/recommend-matches", json={"user_id": "", "limit": 5})
+    assert res.status_code == 422
+
+
+def test_chat_empty_message_rejected(client):
+    res = client.post("/chat", json={"message": ""})
+    assert res.status_code == 422
+
+
+def test_keyword_match_score_prefers_relevant(monkeypatch):
     monkeypatch.setattr(main, "MODEL", None)
-
     job_text = "Python machine learning data preprocessing model evaluation"
-    relevant_resume = "Python developer with machine learning, data preprocessing, and model evaluation experience"
-    unrelated_resume = "Sales manager with customer service and retail operations experience"
+    relevant  = "Python developer with machine learning, data preprocessing, model evaluation"
+    unrelated = "Sales manager with customer service and retail operations"
+    assert main.calculate_cv_match_score(job_text, relevant) > main.calculate_cv_match_score(job_text, unrelated)
 
-    assert main.calculate_cv_match_score(job_text, relevant_resume) > main.calculate_cv_match_score(job_text, unrelated_resume)
+
+def test_keyword_match_score_empty_inputs(monkeypatch):
+    monkeypatch.setattr(main, "MODEL", None)
+    assert main.calculate_cv_match_score("", "some resume") == 0
+    assert main.calculate_cv_match_score("some job", "") == 0
+    assert main.calculate_cv_match_score("", "") == 0
+
+
+def test_keyword_match_score_range(monkeypatch):
+    monkeypatch.setattr(main, "MODEL", None)
+    score = main.calculate_cv_match_score("Python developer Flask REST API", "Python Flask REST API developer")
+    assert 0 <= score <= 100
+
+
+def test_health_fields_present(client):
+    res = client.get("/health")
+    body = res.json()
+    expected_keys = {
+        "status", "model_loaded", "index_loaded", "jobs_db_exists",
+        "index_exists", "sql_server_configured", "gemini_configured",
+        "require_remote_resume_url",
+    }
+    assert expected_keys.issubset(body.keys())

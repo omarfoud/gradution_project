@@ -279,7 +279,7 @@ def encode_query_cached(query_text: str):
         raise HTTPException(status_code=503, detail="Embedding model is not loaded yet")
     vector = MODEL.encode([query_text], convert_to_numpy=True).astype("float32")
     faiss.normalize_L2(vector)
-    return vector
+    return vector.copy()
 
 
 def fetch_jobs_by_faiss_ids(conn: sqlite3.Connection, faiss_ids: list[int], filters: dict) -> list[sqlite3.Row]:
