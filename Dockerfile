@@ -6,8 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     CUDA_VISIBLE_DEVICES="" \
-    DB_PATH=/app/jobs.db \
-    INDEX_PATH=/app/jobs.index
+    HF_ARTIFACT_DIR=/app/artifacts \
+    DB_PATH=/app/artifacts/jobs.db \
+    INDEX_PATH=/app/artifacts/jobs.index
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -32,11 +33,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY . .
 
-# NOTE: jobs.db and jobs.index are NOT baked into this image.
-# They are downloaded at container startup from Azure Blob Storage
-# using the ARTIFACTS_URL_DB and ARTIFACTS_URL_INDEX environment variables,
-# or can be volume-mounted for local development.
-# See entrypoint.py and .env.example for configuration.
+RUN mkdir -p /app/artifacts
 
 EXPOSE 8000
 

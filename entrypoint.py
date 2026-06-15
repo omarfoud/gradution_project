@@ -1,122 +1,106 @@
 import os
-import sys
+import shutil
 import subprocess
+import sys
+from pathlib import Path
+from urllib.request import urlretrieve
 
-DB_PATH    = os.getenv("DB_PATH", "jobs.db")
-INDEX_PATH = os.getenv("INDEX_PATH", "jobs.index")
+from huggingface_hub import hf_hub_download
 
-# ---------------------------------------------------------------------------
-# Artifact source — choose ONE by setting env vars in .env:
-#
-#   Option A: Hugging Face (recommended — free, no subscription needed)
-#     HF_REPO_ID = "your-hf-username/jobify-artifacts"
-#     HF_TOKEN   = "hf_xxxxxxxxxxxx"   (from huggingface.co/settings/tokens)
-#
-#   Option B: Any direct HTTPS URL (Azure Blob SAS, Google Drive, etc.)
-#     ARTIFACTS_URL_DB    = "https://..."
-#     ARTIFACTS_URL_INDEX = "https://..."
-#
-#   Option C: Volume mount (local dev) — set neither; mount files as volumes.
-# ---------------------------------------------------------------------------
-HF_REPO_ID          = os.getenv("HF_REPO_ID", "")
-HF_TOKEN            = os.getenv("HF_TOKEN", "")
-ARTIFACTS_URL_DB    = os.getenv("ARTIFACTS_URL_DB", "")
+DB_PATH = os.getenv("DB_PATH", "/app/artifacts/jobs.db")
+INDEX_PATH = os.getenv("INDEX_PATH", "/app/artifacts/jobs.index")
+
+HF_REPO_ID = os.getenv("HF_REPO_ID", "")
+HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "dataset")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+HF_DB_FILENAME = os.getenv("HF_DB_FILENAME", "jobs.db")
+HF_INDEX_FILENAME = os.getenv("HF_INDEX_FILENAME", "jobs.index")
+HF_ARTIFACT_DIR = os.getenv("HF_ARTIFACT_DIR", "/app/artifacts")
+
+ARTIFACTS_URL_DB = os.getenv("ARTIFACTS_URL_DB", "")
 ARTIFACTS_URL_INDEX = os.getenv("ARTIFACTS_URL_INDEX", "")
 
 
-# ---------------------------------------------------------------------------
-# 1. Safeguard: reject empty directories Docker creates on missing volume mounts
-# ---------------------------------------------------------------------------
-for path, label in [(DB_PATH, "jobs.db"), (INDEX_PATH, "jobs.index")]:
+def fail(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+def validate_file_path(path: str, label: str) -> None:
     if os.path.exists(path) and not os.path.isfile(path):
-        print(
+        fail(
             f"CRITICAL ERROR: '{path}' exists but is a directory, not a file!\n"
-            f"Fix: place the real {label} in the project root before building.",
-            file=sys.stderr, flush=True,
+            f"Expected the real {label} file."
         )
-        sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# 2. Download missing artifacts
-# ---------------------------------------------------------------------------
-def download_from_hf(repo_id: str, filename: str, dest: str, token: str) -> None:
-    print(f"Downloading {filename} from Hugging Face ({repo_id})...", flush=True)
+def download_from_hf(filename: str, target_path: str, label: str) -> str:
+    artifact_dir = Path(HF_ARTIFACT_DIR)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"{label} missing. Downloading '{filename}' from Hugging Face repo '{HF_REPO_ID}'...", flush=True)
     try:
-        from huggingface_hub import hf_hub_download
-        tmp = hf_hub_download(
-            repo_id=repo_id,
+        downloaded_path = hf_hub_download(
+            repo_id=HF_REPO_ID,
             filename=filename,
-            repo_type="dataset",
-            token=token or None,
-            local_dir="/tmp/hf_artifacts",
+            repo_type=HF_REPO_TYPE,
+            token=HF_TOKEN or None,
+            local_dir=str(artifact_dir),
         )
-        import shutil
-        shutil.move(tmp, dest)
-        size_mb = os.path.getsize(dest) / 1024 / 1024
-        print(f"✅ {filename} downloaded ({size_mb:.0f} MB)", flush=True)
     except Exception as exc:
-        print(
-            f"CRITICAL ERROR: Failed to download {filename} from Hugging Face: {exc}\n"
-            f"Check HF_REPO_ID and HF_TOKEN in your .env file.",
-            file=sys.stderr, flush=True,
-        )
-        sys.exit(1)
+        fail(f"CRITICAL ERROR: Failed to download {label} from Hugging Face: {exc}")
+
+    downloaded_path = str(Path(downloaded_path).resolve())
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if str(target.parent.resolve()) != str(artifact_dir.resolve()) and not target.exists():
+        shutil.copyfile(downloaded_path, target)
+        return str(target.resolve())
+
+    return downloaded_path
 
 
-def download_from_url(url: str, dest: str, label: str) -> None:
-    print(f"Downloading {label} from URL...", flush=True)
+def download_from_url(url: str, target_path: str, label: str) -> str:
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+
+    print(f"{label} missing. Downloading from direct URL...", flush=True)
     try:
-        import urllib.request
-        tmp = dest + ".tmp"
-        urllib.request.urlretrieve(url, tmp)
-        os.rename(tmp, dest)
-        size_mb = os.path.getsize(dest) / 1024 / 1024
-        print(f"✅ {label} downloaded ({size_mb:.0f} MB)", flush=True)
+        urlretrieve(url, temp_path)
+        os.replace(temp_path, target)
     except Exception as exc:
-        print(
-            f"CRITICAL ERROR: Failed to download {label}: {exc}\n"
-            f"Check ARTIFACTS_URL_DB / ARTIFACTS_URL_INDEX in your .env file.",
-            file=sys.stderr, flush=True,
-        )
-        sys.exit(1)
+        fail(f"CRITICAL ERROR: Failed to download {label} from direct URL: {exc}")
+
+    return str(target.resolve())
 
 
-missing_db    = not os.path.isfile(DB_PATH)
-missing_index = not os.path.isfile(INDEX_PATH)
+def ensure_artifact(path: str, label: str, hf_filename: str, direct_url: str) -> str:
+    validate_file_path(path, label)
+    if os.path.isfile(path):
+        return path
 
-if missing_db or missing_index:
     if HF_REPO_ID:
-        # Option A: Hugging Face
-        if missing_db:
-            download_from_hf(HF_REPO_ID, "jobs.db", DB_PATH, HF_TOKEN)
-        if missing_index:
-            download_from_hf(HF_REPO_ID, "jobs.index", INDEX_PATH, HF_TOKEN)
+        return download_from_hf(hf_filename, path, label)
 
-    elif ARTIFACTS_URL_DB and ARTIFACTS_URL_INDEX:
-        # Option B: Direct URLs
-        if missing_db:
-            download_from_url(ARTIFACTS_URL_DB, DB_PATH, "jobs.db")
-        if missing_index:
-            download_from_url(ARTIFACTS_URL_INDEX, INDEX_PATH, "jobs.index")
+    if direct_url:
+        return download_from_url(direct_url, path, label)
 
-    else:
-        print(
-            "CRITICAL ERROR: Search artifacts (jobs.db / jobs.index) are missing "
-            "and no download source is configured.\n\n"
-            "Choose one of:\n"
-            "  A) Hugging Face (free):  set HF_REPO_ID and HF_TOKEN in .env\n"
-            "  B) Direct URL:           set ARTIFACTS_URL_DB and ARTIFACTS_URL_INDEX in .env\n"
-            "  C) Local dev:            volume-mount jobs.db and jobs.index via docker-compose\n\n"
-            "See ARTIFACTS_SETUP.md for full instructions.",
-            file=sys.stderr, flush=True,
-        )
-        sys.exit(1)
+    fail(
+        f"CRITICAL ERROR: {label} is missing at '{path}' and no artifact source is configured.\n\n"
+        "Set HF_REPO_ID and HF_TOKEN in .env for Hugging Face download, or set direct URLs:\n"
+        "  ARTIFACTS_URL_DB=https://...\n"
+        "  ARTIFACTS_URL_INDEX=https://...\n\n"
+        "See ARTIFACTS_SETUP.md for full instructions."
+    )
 
 
-# ---------------------------------------------------------------------------
-# 3. Start the application
-# ---------------------------------------------------------------------------
+DB_PATH = ensure_artifact(DB_PATH, "SQLite database", HF_DB_FILENAME, ARTIFACTS_URL_DB)
+INDEX_PATH = ensure_artifact(INDEX_PATH, "FAISS index", HF_INDEX_FILENAME, ARTIFACTS_URL_INDEX)
+os.environ["DB_PATH"] = DB_PATH
+os.environ["INDEX_PATH"] = INDEX_PATH
+
 print("Starting FastAPI via Uvicorn...", flush=True)
 subprocess.run(
     ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"],

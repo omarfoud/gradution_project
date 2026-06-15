@@ -10,20 +10,19 @@ services:
       - .env
     environment:
       PYTHONPATH: /app
-      DB_PATH: /app/jobs.db
-      INDEX_PATH: /app/jobs.index
+      HF_REPO_ID: ${HF_REPO_ID:-omaralifouda/jobify-artifacts}
+      HF_REPO_TYPE: ${HF_REPO_TYPE:-dataset}
+      HF_DB_FILENAME: ${HF_DB_FILENAME:-jobs.db}
+      HF_INDEX_FILENAME: ${HF_INDEX_FILENAME:-jobs.index}
+      HF_ARTIFACT_DIR: /app/artifacts
+      DB_PATH: /app/artifacts/jobs.db
+      INDEX_PATH: /app/artifacts/jobs.index
       MODEL_NAME: all-MiniLM-L6-v2
       DEVICE: cpu
       SQL_PORT: 1433
       SQL_DRIVER: ODBC Driver 18 for SQL Server
-    # -----------------------------------------------------------------------
-    # LOCAL DEVELOPMENT ONLY: mount pre-built index files as volumes.
-    # In production, set ARTIFACTS_URL_DB and ARTIFACTS_URL_INDEX in .env
-    # and the container will download them from Azure Blob Storage on startup.
-    # -----------------------------------------------------------------------
-    # volumes:
-    #   - ./jobs.db:/app/jobs.db
-    #   - ./jobs.index:/app/jobs.index
+    volumes:
+      - hf-artifacts:/app/artifacts
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -31,3 +30,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+
+volumes:
+  hf-artifacts:

@@ -3,13 +3,13 @@
 # ==========================================
 index.html
 
-# Exclude large datasets by default, but keep local search artifacts in the Docker image.
+# Exclude large datasets and local artifact repos from the Docker image.
 *.db
 *.index
 *.csv
-!jobs.db
-!jobs.index
 *.docx
+temp_hf_repo/
+upload_artifacts.py
 
 # Exclude Git & Local Environments
 .git

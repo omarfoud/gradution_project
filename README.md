@@ -36,7 +36,9 @@ See:
 
 1. Copy `.env.example` to `.env`.
 2. Fill SQL Server credentials.
-3. Put `job_descriptions.csv` in the project root.
+3. Fill Hugging Face settings:
+   - `HF_REPO_ID=omaralifouda/jobify-artifacts`
+   - `HF_TOKEN=...` if the dataset repo is private.
 4. Run the required SQL script on the hosted database:
 
 ```bash
@@ -48,6 +50,8 @@ sql/backend_required_changes.sql
 ```bash
 python ingest.py
 ```
+
+This step is only needed when regenerating local `jobs.db` and `jobs.index`. Docker downloads the current artifacts from Hugging Face automatically.
 
 6. Start the API:
 
@@ -77,17 +81,16 @@ GET /health/app-db
 `Resume.FilePath` should be an HTTP/HTTPS URL to a reachable PDF or DOCX file.
 Local Windows paths like `C:\Users\...` will not work in Docker/cloud production.
 
-`/search` and `/recommend-matches` use the bundled local `jobs.index` and `jobs.db` files. This is the Docker image deployment mode.
+`/search` and `/recommend-matches` use local `jobs.index` and `jobs.db` files. In Docker, the startup script downloads them from Hugging Face into `/app/artifacts` when they are missing.
 
-## Docker image search files
+## Docker Search Artifacts
 
-This deployment bundles the local search artifacts into the Docker image:
+This deployment keeps the image small and downloads the search artifacts at container startup:
 
 - `jobs.db`
 - `jobs.index`
 
-The container reads `/app/jobs.db` and `/app/jobs.index` directly from the image, so Docker Compose no longer needs to mount those files as volumes.
-These files are intentionally not stored in Git because they are too large for normal GitHub pushes. Keep them in the project root before running `docker compose build`.
+Docker Compose stores them in the `hf-artifacts` volume mounted at `/app/artifacts`, so they are cached between restarts. Set `HF_REPO_ID` and `HF_TOKEN` in `.env` before running `docker compose up --build`.
 
 ## Do not commit
 

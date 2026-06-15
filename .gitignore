@@ -69,6 +69,8 @@ logs/
 # Large data files
 job_descriptions.csv
 Resume.csv
+temp_hf_repo/
+upload_artifacts.py
 
 # Docker
 
