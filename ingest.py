@@ -15,9 +15,10 @@ load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("ingest")
 
+ARTIFACT_DIR = Path(os.getenv("HF_ARTIFACT_DIR", os.getenv("ARTIFACT_DIR", "artifacts")))
 CSV_PATH = os.getenv("CSV_PATH", "job_descriptions.csv")
-DB_PATH = os.getenv("DB_PATH", "jobs.db")
-INDEX_PATH = os.getenv("INDEX_PATH", "jobs.index")
+DB_PATH = os.getenv("DB_PATH", str(ARTIFACT_DIR / "jobs.db"))
+INDEX_PATH = os.getenv("INDEX_PATH", str(ARTIFACT_DIR / "jobs.index"))
 MODEL_NAME = os.getenv("MODEL_NAME", "all-MiniLM-L6-v2")
 DEVICE = os.getenv("DEVICE", "cpu")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "5000"))
@@ -94,6 +95,8 @@ def count_rows(csv_path: str) -> int:
 def setup_database() -> None:
     if not os.path.exists(CSV_PATH):
         raise FileNotFoundError(f"CSV file not found: {CSV_PATH}")
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    Path(INDEX_PATH).parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("Loading CSV header from %s", CSV_PATH)
     sample = pd.read_csv(CSV_PATH, nrows=5)

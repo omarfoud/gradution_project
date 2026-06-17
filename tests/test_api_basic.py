@@ -19,12 +19,15 @@ sys.modules["sentence_transformers"] = st_mod
 # Stub faiss
 faiss_mod = types.ModuleType("faiss")
 class FakeIndex:
-    ntotal = 100
-    nprobe = 20
-    d = 384
+    def __init__(self, *a, **kw):
+        self.ntotal = 100
+        self.nprobe = 20
+        self.d = 384
     def search(self, v, k):
         import numpy as np
         return np.ones((1,k), dtype="float32"), np.arange(k, dtype="int64").reshape(1,k)
+    def add(self, vectors):
+        self.ntotal += len(vectors)
 faiss_mod.IndexFlatIP = FakeIndex
 faiss_mod.IndexIVFFlat = FakeIndex
 faiss_mod.METRIC_INNER_PRODUCT = 0
@@ -187,3 +190,39 @@ def test_health_fields_present(client):
         "require_remote_resume_url",
     }
     assert expected_keys.issubset(body.keys())
+
+
+def test_upsert_job_embedding_writes_sqlite_and_index(monkeypatch, tmp_path):
+    db_path = tmp_path / "jobs.db"
+    index_path = tmp_path / "jobs.index"
+    fake_index = FakeIndex()
+    monkeypatch.setattr(main, "DB_PATH", str(db_path))
+    monkeypatch.setattr(main, "INDEX_PATH", str(index_path))
+    monkeypatch.setattr(main, "MODEL", FakeST())
+    monkeypatch.setattr(main, "INDEX", fake_index)
+    monkeypatch.setattr(main.faiss, "write_index", lambda index, path: index_path.write_text("index"))
+
+    result = main.upsert_job_embedding({
+        "job_id": 123,
+        "title": "Backend Developer",
+        "company": "Jobify",
+        "description": "Build APIs",
+        "qualifications": "Python",
+        "responsibilities": "Develop services",
+        "skills": "FastAPI SQL",
+        "experience": "Junior",
+        "location": "Cairo",
+        "work_type": "Remote",
+        "salary_range": "Negotiable",
+    })
+
+    assert result["job_id"] == 123
+    assert result["faiss_id"] == 100
+    assert result["index_total"] == 101
+    conn = main.sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT job_id, faiss_id, title FROM jobs WHERE job_id = 123").fetchone()
+    finally:
+        conn.close()
+    assert row == (123, 100, "Backend Developer")
+    assert index_path.exists()

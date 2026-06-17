@@ -4,8 +4,10 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 import docx
@@ -32,8 +34,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 MODEL_NAME = os.getenv("MODEL_NAME", "all-MiniLM-L6-v2")
 DEVICE = os.getenv("DEVICE", "cpu")
 
-DB_PATH = os.getenv("DB_PATH", "jobs.db")
-INDEX_PATH = os.getenv("INDEX_PATH", "jobs.index")
+ARTIFACT_DIR = Path(os.getenv("HF_ARTIFACT_DIR", os.getenv("ARTIFACT_DIR", "artifacts")))
+DB_PATH = os.getenv("DB_PATH", str(ARTIFACT_DIR / "jobs.db"))
+INDEX_PATH = os.getenv("INDEX_PATH", str(ARTIFACT_DIR / "jobs.index"))
 
 SQL_SERVER = os.getenv("SQL_SERVER")
 SQL_PORT = os.getenv("SQL_PORT", "1433")
@@ -78,6 +81,7 @@ REQUIRE_REMOTE_RESUME_URL = os.getenv("REQUIRE_REMOTE_RESUME_URL", "true").lower
 
 MODEL: Optional[SentenceTransformer] = None
 INDEX = None
+INDEX_LOCK = threading.RLock()
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -188,13 +192,19 @@ class CompanyGenerateJobPostRequest(CompanyContextRequest):
     salary_range: Optional[str] = None
 
 
+class SyncJobEmbeddingRequest(CompanyContextRequest):
+    job_posting_id: str = Field(..., min_length=1)
+
+
 class CompanyHiringInsightsRequest(CompanyContextRequest):
     job_posting_id: Optional[str] = None
 
 
 def get_jobs_db() -> sqlite3.Connection:
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -303,6 +313,103 @@ def fetch_jobs_by_faiss_ids(conn: sqlite3.Connection, faiss_ids: list[int], filt
             query += " AND " + " AND ".join(conditions)
         rows.extend(conn.execute(query, params).fetchall())
     return rows
+
+
+def ensure_jobs_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS jobs (
+            faiss_id INTEGER PRIMARY KEY,
+            job_id INTEGER UNIQUE,
+            title TEXT,
+            company TEXT,
+            description TEXT,
+            qualifications TEXT,
+            responsibilities TEXT,
+            skills TEXT,
+            experience TEXT,
+            location TEXT,
+            work_type TEXT,
+            salary_range TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_job_id ON jobs(job_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_location ON jobs(location)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_work_type ON jobs(work_type)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_experience ON jobs(experience)")
+    conn.commit()
+
+
+def build_search_job_text(job: dict) -> str:
+    return " ".join(
+        str(value or "")
+        for value in [
+            job.get("title"),
+            job.get("skills"),
+            job.get("qualifications"),
+            job.get("responsibilities"),
+            job.get("description"),
+            job.get("experience"),
+            job.get("location"),
+            job.get("work_type"),
+        ]
+    ).strip()
+
+
+def upsert_job_embedding(job: dict) -> dict:
+    global INDEX
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Embedding model is not loaded yet.")
+    if INDEX is None:
+        raise HTTPException(status_code=503, detail="FAISS index is not loaded yet.")
+
+    job_id = int(job["job_id"])
+    embed_text = build_search_job_text(job)
+    if not embed_text:
+        raise HTTPException(status_code=400, detail="Job does not contain enough text to embed.")
+
+    with INDEX_LOCK:
+        vector = MODEL.encode([embed_text], convert_to_numpy=True).astype("float32")
+        faiss.normalize_L2(vector)
+        faiss_id = int(getattr(INDEX, "ntotal", 0))
+        INDEX.add(vector)
+
+        conn = get_jobs_db()
+        try:
+            ensure_jobs_table(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO jobs (
+                    faiss_id, job_id, title, company, description,
+                    qualifications, responsibilities, skills, experience,
+                    location, work_type, salary_range
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    faiss_id,
+                    job_id,
+                    job.get("title"),
+                    job.get("company"),
+                    job.get("description"),
+                    job.get("qualifications"),
+                    job.get("responsibilities"),
+                    job.get("skills"),
+                    job.get("experience"),
+                    job.get("location"),
+                    job.get("work_type"),
+                    job.get("salary_range"),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        Path(INDEX_PATH).parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(INDEX, INDEX_PATH)
+
+    encode_query_cached.cache_clear()
+    return {"job_id": job_id, "faiss_id": faiss_id, "index_total": int(getattr(INDEX, "ntotal", faiss_id + 1))}
 
 
 def search_hybrid(query_text: str, *, k: int = RESULTS_LIMIT, location: Optional[str] = None, work_type: Optional[str] = None, experience: Optional[str] = None):
@@ -414,6 +521,69 @@ def sql_column_exists(cursor, table_name: str, column_name: str) -> bool:
     return cursor.fetchone()[0] is not None
 
 
+def fetch_sql_job_for_embedding(job_posting_id: str, company_id: Optional[str] = None) -> dict:
+    conn = get_app_db()
+    try:
+        cursor = conn.cursor()
+        job_location_expr = "jp.Location" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Location") else "c.Location"
+        qualifications_expr = "jp.Qualifications" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Qualifications") else "CAST(NULL AS NVARCHAR(MAX))"
+        skills_expr = "jp.Skills" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Skills") else "CAST(NULL AS NVARCHAR(MAX))"
+        experience_expr = "jp.Experience" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Experience") else "CAST(NULL AS NVARCHAR(MAX))"
+        where = "jp.JobID = ?"
+        params = [str(job_posting_id)]
+        if company_id is not None:
+            where += " AND jp.CompanyID = ?"
+            params.append(str(company_id))
+        cursor.execute(
+            f"""
+            SELECT TOP 1
+                jp.JobID,
+                jp.Title,
+                c.Name,
+                jp.Description,
+                {qualifications_expr} AS Qualifications,
+                jp.Responsibility,
+                {skills_expr} AS Skills,
+                {experience_expr} AS Experience,
+                {job_location_expr} AS Location,
+                jp.JobTypes,
+                jp.MinSalary,
+                jp.MaxSalary,
+                jp.IsRemote
+            FROM {JOB_POSTING_TABLE} jp
+            LEFT JOIN {COMPANY_TABLE} c ON c.CompanyID = jp.CompanyID
+            WHERE {where}
+            """,
+            *params,
+        )
+        row = cursor.fetchone()
+    except pyodbc.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Job embedding lookup failed: {exc}") from exc
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Job posting not found")
+
+    salary_range = "Negotiable"
+    if row[10] is not None and row[11] is not None:
+        salary_range = f"{float(row[10]):.2f} - {float(row[11]):.2f}"
+    work_type = str(row[9]) if row[9] is not None else ("Remote" if row[12] else None)
+    return {
+        "job_id": int(row[0]),
+        "title": row[1],
+        "company": row[2],
+        "description": row[3],
+        "qualifications": row[4],
+        "responsibilities": row[5],
+        "skills": row[6],
+        "experience": row[7],
+        "location": row[8],
+        "work_type": work_type,
+        "salary_range": salary_range,
+    }
+
+
 def get_candidates_for_job(company_id: str, job_posting_id: str, limit: int) -> list[dict]:
     limit = max(1, min(int(limit), 25))
     conn = get_app_db()
@@ -519,6 +689,12 @@ def build_job_post_analysis_prompt(company: dict, job: dict) -> str:
 
 def build_candidates_prompt(company: dict, job: dict, candidates: list[dict]) -> str:
     return f"You are an AI recruiter assistant.\n{get_company_summary_for_prompt(company)}\nJob: {job}\nApplicants: {candidates}\nReturn ranked_candidates with match_score, strengths, gaps, recommendation.".strip()
+
+
+def require_admin_key(x_admin_key: Optional[str]) -> None:
+    if ADMIN_API_KEY:
+        if not x_admin_key or x_admin_key != ADMIN_API_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-Admin-API-Key header")
 
 
 @app.get("/health")
@@ -643,11 +819,20 @@ def company_find_candidates(req: CompanyFindCandidatesRequest, authorization: Op
     return {"ranking": ranking, "company": company, "job": job, "candidates": public_candidates}
 
 
+@app.post("/admin/sync-job-embedding")
+def sync_job_embedding(req: SyncJobEmbeddingRequest, x_admin_key: Optional[str] = Header(None, alias="X-Admin-API-Key")):
+    require_admin_key(x_admin_key)
+    company_id = req.company_id
+    if req.company_user_id and not company_id:
+        company_id = ensure_company_context(req.company_user_id, None)["company_id"]
+    job = fetch_sql_job_for_embedding(req.job_posting_id, company_id)
+    result = upsert_job_embedding(job)
+    return {"status": "synced", "job": job, **result}
+
+
 @app.post("/clear-cache")
 def clear_cache(x_admin_key: Optional[str] = Header(None, alias="X-Admin-API-Key")):
-    if ADMIN_API_KEY:
-        if not x_admin_key or x_admin_key != ADMIN_API_KEY:
-            raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-Admin-API-Key header")
+    require_admin_key(x_admin_key)
     get_resume_text_for_user.cache_clear()
     encode_query_cached.cache_clear()
     return {"status": "cache cleared"}

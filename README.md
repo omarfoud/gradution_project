@@ -12,6 +12,7 @@ This version is prepared for integration with the graduation project's hosted SQ
 - Gemini analysis and career chat.
 - Dockerfile with Microsoft ODBC Driver 18 for SQL Server.
 - `/health/app-db` endpoint to test SQL Server connection.
+- `/admin/sync-job-embedding` endpoint to add new SQL Server jobs to `jobs.db` and `jobs.index`.
 - Backend handoff documentation and SQL script.
 
 ## Important backend requirement
@@ -74,6 +75,7 @@ GET /health/app-db
 - `POST /analyze-job-id`
 - `POST /search`
 - `POST /chat`
+- `POST /admin/sync-job-embedding`
 - `POST /clear-cache`
 
 ## Production note
@@ -82,6 +84,31 @@ GET /health/app-db
 Local Windows paths like `C:\Users\...` will not work in Docker/cloud production.
 
 `/search` and `/recommend-matches` use local `jobs.index` and `jobs.db` files. In Docker, the startup script downloads them from Hugging Face into `/app/artifacts` when they are missing.
+
+## Live Job Embedding Sync
+
+When the main backend creates a new job in the deployed SQL Server database, it should call the AI backend immediately after the SQL insert succeeds:
+
+```http
+POST /admin/sync-job-embedding
+X-Admin-API-Key: <ADMIN_API_KEY>
+Content-Type: application/json
+
+{
+  "job_posting_id": "123",
+  "company_id": "45"
+}
+```
+
+The AI backend will:
+
+1. Read the job from SQL Server.
+2. Build the searchable job text.
+3. Create an embedding with the configured SentenceTransformer model.
+4. Append the vector to `jobs.index`.
+5. Insert or replace the job metadata in `jobs.db`.
+
+If the same `JobID` is synced again, SQLite points that job to the newest vector. Older orphan vectors may remain in FAISS, but they are ignored because they no longer have a matching row in `jobs.db`.
 
 ## Docker Search Artifacts
 
