@@ -85,13 +85,15 @@ def test_load_resume_bytes_http_success(monkeypatch):
     class DummyResponse:
         content = b"abc"
         def raise_for_status(self): return None
-    monkeypatch.setattr(main.requests, "get", lambda url, timeout: DummyResponse())
+        is_redirect = False
+        status_code = 200
+    monkeypatch.setattr(main.requests, "get", lambda url, **kwargs: DummyResponse())
     data = main.load_resume_bytes("https://example.com/resume.pdf")
     assert data == b"abc"
 
 
 def test_load_resume_bytes_http_failure(monkeypatch):
-    def raise_exc(url, timeout):
+    def raise_exc(url, **kwargs):
         raise main.requests.RequestException("boom")
     monkeypatch.setattr(main.requests, "get", raise_exc)
     with pytest.raises(HTTPException) as exc:
@@ -160,3 +162,34 @@ def test_sql_identifier_validation():
         assert re.fullmatch(pattern, v), f"{v} should be valid"
     for v in invalid:
         assert not re.fullmatch(pattern, v), f"{v} should be invalid"
+
+
+def test_load_resume_bytes_concurrency(monkeypatch):
+    import concurrent.futures
+    import socket
+
+    class DummyResponse:
+        content = b"pdf-content"
+        is_redirect = False
+        status_code = 200
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(main.requests, "get", lambda url, **kwargs: DummyResponse())
+
+    # Mock socket.getaddrinfo to resolve host{i}.com to safe IPs
+    original_gai = socket.getaddrinfo
+    def fake_gai(host, port, *args, **kwargs):
+        if host.startswith("host") and host.endswith(".com"):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', port or 0))]
+        return original_gai(host, port, *args, **kwargs)
+    monkeypatch.setattr(socket, "getaddrinfo", fake_gai)
+
+    urls = [f"https://host{i}.com/resume.pdf" for i in range(10)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(main.load_resume_bytes, url) for url in urls]
+        results = [f.result() for f in futures]
+
+    for r in results:
+        assert r == b"pdf-content"

@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import sqlite3
 import threading
 from contextlib import asynccontextmanager
@@ -52,7 +52,7 @@ SQL_ENCRYPT = os.getenv("SQL_ENCRYPT", "yes")
 JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-key")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() in ("true", "1", "yes")
-FAISS_SAVE_DIRECT = os.getenv("FAISS_SAVE_DIRECT", "true").lower() in ("true", "1", "yes")
+FAISS_SAVE_DIRECT = os.getenv("FAISS_SAVE_DIRECT", "false").lower() in ("true", "1", "yes")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 
 INSECURE_PLACEHOLDERS = {
@@ -293,143 +293,69 @@ def get_resume_path_by_user_id(user_id: str) -> str:
     return str(row[0])
 
 
-def is_safe_url(url: str) -> bool:
+def _validate_url_and_ips(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Invalid URL scheme. Only http/https are allowed.")
+    hostname = parsed.hostname
+    if not hostname:
+        raise HTTPException(status_code=400, detail="Invalid URL (missing hostname)")
+
     try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return False
-        hostname = parsed.hostname
-        if not hostname:
-            return False
-
-        hostname_lower = hostname.lower()
-
-        if ALLOWED_RESUME_DOMAINS:
-            domain_allowed = False
-            for allowed_domain in ALLOWED_RESUME_DOMAINS:
-                if hostname_lower == allowed_domain or hostname_lower.endswith("." + allowed_domain):
-                    domain_allowed = True
-                    break
-            if not domain_allowed:
-                return False
-
         ips = socket.getaddrinfo(hostname, None)
-        for ip_info in ips:
-            ip_str = ip_info[4][0]
-            if "%" in ip_str:
-                ip_str = ip_str.split("%")[0]
-            ip = ipaddress.ip_address(ip_str)
-            if (
-                ip.is_private or
-                ip.is_loopback or
-                ip.is_link_local or
-                ip.is_multicast or
-                ip.is_reserved or
-                ip.is_unspecified
-            ):
-                return False
-        return True
-    except Exception:
-        return False
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to resolve hostname '{hostname}': {exc}")
+
+    for ip_info in ips:
+        ip_str = ip_info[4][0]
+        if "%" in ip_str:
+            ip_str = ip_str.split("%")[0]
+        ip = ipaddress.ip_address(ip_str)
+        if (
+            ip.is_private or
+            ip.is_loopback or
+            ip.is_link_local or
+            ip.is_multicast or
+            ip.is_reserved or
+            ip.is_unspecified
+        ):
+            raise HTTPException(status_code=400, detail=f"Unsafe IP address detected for {hostname} (SSRF protection block)")
+
+    if ALLOWED_RESUME_DOMAINS:
+        hostname_lower = hostname.lower()
+        domain_allowed = False
+        for allowed_domain in ALLOWED_RESUME_DOMAINS:
+            if hostname_lower == allowed_domain or hostname_lower.endswith("." + allowed_domain):
+                domain_allowed = True
+                break
+        if not domain_allowed:
+            raise HTTPException(status_code=400, detail=f"Domain '{hostname}' is not allowed (domain allowlist block)")
+
+    return hostname
 
 
 def load_resume_bytes(resume_path: str) -> bytes:
     if resume_path.startswith(("http://", "https://")):
-        parsed = urlparse(resume_path)
-        hostname = parsed.hostname
-        if not hostname:
-            raise HTTPException(status_code=400, detail="Invalid resume URL (missing hostname)")
-
-        try:
-            ips = socket.getaddrinfo(hostname, None)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Failed to resolve hostname '{hostname}': {exc}")
-
-        validated_ips = []
-        for ip_info in ips:
-            ip_str = ip_info[4][0]
-            if "%" in ip_str:
-                ip_str = ip_str.split("%")[0]
-            ip = ipaddress.ip_address(ip_str)
-            if (
-                ip.is_private or
-                ip.is_loopback or
-                ip.is_link_local or
-                ip.is_multicast or
-                ip.is_reserved or
-                ip.is_unspecified
-            ):
-                raise HTTPException(status_code=400, detail="Unsafe resume URL IP address detected (SSRF protection block)")
-            validated_ips.append(ip_info)
-
-        if not validated_ips:
-            raise HTTPException(status_code=400, detail="No IP address resolved for hostname")
-
-        if ALLOWED_RESUME_DOMAINS:
-            hostname_lower = hostname.lower()
-            domain_allowed = False
-            for allowed_domain in ALLOWED_RESUME_DOMAINS:
-                if hostname_lower == allowed_domain or hostname_lower.endswith("." + allowed_domain):
-                    domain_allowed = True
-                    break
-            if not domain_allowed:
-                raise HTTPException(status_code=400, detail="Resume URL domain is not allowed (domain allowlist block)")
-
-        original_getaddrinfo = socket.getaddrinfo
-
-        def safe_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-            if host == hostname:
-                res = []
-                for item in validated_ips:
-                    old_sa = item[4]
-                    if len(old_sa) == 2:
-                        new_sa = (old_sa[0], port)
-                    else:
-                        new_sa = (old_sa[0], port, old_sa[2], old_sa[3])
-                    res.append((item[0], type or item[1], proto or item[2], item[3], new_sa))
-                return res
-
+        url = resume_path
+        max_redirects = 5
+        for _ in range(max_redirects):
+            _validate_url_and_ips(url)
             try:
-                resolved = original_getaddrinfo(host, port, family, type, proto, flags)
-            except Exception as exc:
-                raise OSError(f"Failed to resolve redirected hostname '{host}': {exc}")
+                response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=False)
+            except requests.RequestException as exc:
+                raise HTTPException(status_code=502, detail=f"Failed to download resume: {exc}") from exc
 
-            for item in resolved:
-                ip_str = item[4][0]
-                if "%" in ip_str:
-                    ip_str = ip_str.split("%")[0]
-                ip = ipaddress.ip_address(ip_str)
-                if (
-                    ip.is_private or
-                    ip.is_loopback or
-                    ip.is_link_local or
-                    ip.is_multicast or
-                    ip.is_reserved or
-                    ip.is_unspecified
-                ):
-                    raise OSError("Unsafe redirected IP address detected (SSRF protection block)")
+            if response.is_redirect or response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location:
+                    raise HTTPException(status_code=502, detail="Redirect response missing Location header")
+                url = urljoin(url, location)
+                continue
 
-            if ALLOWED_RESUME_DOMAINS:
-                host_lower = host.lower()
-                domain_allowed = False
-                for allowed_domain in ALLOWED_RESUME_DOMAINS:
-                    if host_lower == allowed_domain or host_lower.endswith("." + allowed_domain):
-                        domain_allowed = True
-                        break
-                if not domain_allowed:
-                    raise OSError("Redirected domain is not in ALLOWED_RESUME_DOMAINS")
-
-            return resolved
-
-        try:
-            socket.getaddrinfo = safe_getaddrinfo
-            response = requests.get(resume_path, timeout=REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
             return response.content
-        except requests.RequestException as exc:
-            raise HTTPException(status_code=502, detail=f"Failed to download resume: {exc}") from exc
-        finally:
-            socket.getaddrinfo = original_getaddrinfo
+        raise HTTPException(status_code=400, detail="Too many redirects")
+
     if REQUIRE_REMOTE_RESUME_URL:
         raise HTTPException(status_code=400, detail="Resume.FilePath must be an http/https URL in production.")
     if not os.path.exists(resume_path):
