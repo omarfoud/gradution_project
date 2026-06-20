@@ -52,6 +52,7 @@ SQL_ENCRYPT = os.getenv("SQL_ENCRYPT", "yes")
 JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-key")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() in ("true", "1", "yes")
+FAISS_SAVE_DIRECT = os.getenv("FAISS_SAVE_DIRECT", "true").lower() in ("true", "1", "yes")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 
 INSECURE_PLACEHOLDERS = {
@@ -115,15 +116,22 @@ def faiss_index_autosave_worker():
         time.sleep(30)
         if INDEX_DIRTY and INDEX is not None:
             try:
-                with INDEX_LOCK:
-                    cloned_index = faiss.clone_index(INDEX)
-                    INDEX_DIRTY = False
-                logger.info("Asynchronously saving FAISS index to %s...", INDEX_PATH)
-                Path(INDEX_PATH).parent.mkdir(parents=True, exist_ok=True)
-                faiss.write_index(cloned_index, INDEX_PATH)
+                if FAISS_SAVE_DIRECT:
+                    with INDEX_LOCK:
+                        INDEX_DIRTY = False
+                        logger.info("Saving FAISS index directly to %s...", INDEX_PATH)
+                        Path(INDEX_PATH).parent.mkdir(parents=True, exist_ok=True)
+                        faiss.write_index(INDEX, INDEX_PATH)
+                else:
+                    with INDEX_LOCK:
+                        cloned_index = faiss.clone_index(INDEX)
+                        INDEX_DIRTY = False
+                    logger.info("Asynchronously saving FAISS index to %s...", INDEX_PATH)
+                    Path(INDEX_PATH).parent.mkdir(parents=True, exist_ok=True)
+                    faiss.write_index(cloned_index, INDEX_PATH)
                 logger.info("FAISS index saved successfully.")
             except Exception as exc:
-                logger.error("Failed to save FAISS index asynchronously: %s", exc)
+                logger.error("Failed to save FAISS index: %s", exc)
                 INDEX_DIRTY = True
     logger.info("FAISS index autosave worker stopped.")
 
@@ -327,14 +335,101 @@ def is_safe_url(url: str) -> bool:
 
 def load_resume_bytes(resume_path: str) -> bytes:
     if resume_path.startswith(("http://", "https://")):
-        if not is_safe_url(resume_path):
-            raise HTTPException(status_code=400, detail="Unsafe resume URL detected (SSRF protection block)")
+        parsed = urlparse(resume_path)
+        hostname = parsed.hostname
+        if not hostname:
+            raise HTTPException(status_code=400, detail="Invalid resume URL (missing hostname)")
+
         try:
+            ips = socket.getaddrinfo(hostname, None)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to resolve hostname '{hostname}': {exc}")
+
+        validated_ips = []
+        for ip_info in ips:
+            ip_str = ip_info[4][0]
+            if "%" in ip_str:
+                ip_str = ip_str.split("%")[0]
+            ip = ipaddress.ip_address(ip_str)
+            if (
+                ip.is_private or
+                ip.is_loopback or
+                ip.is_link_local or
+                ip.is_multicast or
+                ip.is_reserved or
+                ip.is_unspecified
+            ):
+                raise HTTPException(status_code=400, detail="Unsafe resume URL IP address detected (SSRF protection block)")
+            validated_ips.append(ip_info)
+
+        if not validated_ips:
+            raise HTTPException(status_code=400, detail="No IP address resolved for hostname")
+
+        if ALLOWED_RESUME_DOMAINS:
+            hostname_lower = hostname.lower()
+            domain_allowed = False
+            for allowed_domain in ALLOWED_RESUME_DOMAINS:
+                if hostname_lower == allowed_domain or hostname_lower.endswith("." + allowed_domain):
+                    domain_allowed = True
+                    break
+            if not domain_allowed:
+                raise HTTPException(status_code=400, detail="Resume URL domain is not allowed (domain allowlist block)")
+
+        original_getaddrinfo = socket.getaddrinfo
+
+        def safe_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            if host == hostname:
+                res = []
+                for item in validated_ips:
+                    old_sa = item[4]
+                    if len(old_sa) == 2:
+                        new_sa = (old_sa[0], port)
+                    else:
+                        new_sa = (old_sa[0], port, old_sa[2], old_sa[3])
+                    res.append((item[0], type or item[1], proto or item[2], item[3], new_sa))
+                return res
+
+            try:
+                resolved = original_getaddrinfo(host, port, family, type, proto, flags)
+            except Exception as exc:
+                raise OSError(f"Failed to resolve redirected hostname '{host}': {exc}")
+
+            for item in resolved:
+                ip_str = item[4][0]
+                if "%" in ip_str:
+                    ip_str = ip_str.split("%")[0]
+                ip = ipaddress.ip_address(ip_str)
+                if (
+                    ip.is_private or
+                    ip.is_loopback or
+                    ip.is_link_local or
+                    ip.is_multicast or
+                    ip.is_reserved or
+                    ip.is_unspecified
+                ):
+                    raise OSError("Unsafe redirected IP address detected (SSRF protection block)")
+
+            if ALLOWED_RESUME_DOMAINS:
+                host_lower = host.lower()
+                domain_allowed = False
+                for allowed_domain in ALLOWED_RESUME_DOMAINS:
+                    if host_lower == allowed_domain or host_lower.endswith("." + allowed_domain):
+                        domain_allowed = True
+                        break
+                if not domain_allowed:
+                    raise OSError("Redirected domain is not in ALLOWED_RESUME_DOMAINS")
+
+            return resolved
+
+        try:
+            socket.getaddrinfo = safe_getaddrinfo
             response = requests.get(resume_path, timeout=REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
             return response.content
         except requests.RequestException as exc:
             raise HTTPException(status_code=502, detail=f"Failed to download resume: {exc}") from exc
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
     if REQUIRE_REMOTE_RESUME_URL:
         raise HTTPException(status_code=400, detail="Resume.FilePath must be an http/https URL in production.")
     if not os.path.exists(resume_path):
@@ -620,7 +715,7 @@ def ensure_company_context(company_user_id: Optional[str], company_id: Optional[
         raise HTTPException(status_code=404, detail="Company not found")
     company = {"company_id": str(row[0]), "name": row[1], "industry": row[2], "website_url": row[3], "headquarter_address": row[4], "location": row[5], "logo_url": row[6], "user_id": row[7]}
     
-    if REQUIRE_AUTH and sub is not None:
+    if sub is not None:
         if str(company["user_id"]) != str(sub):
             raise HTTPException(status_code=403, detail="Forbidden: You do not have access to this company context")
             

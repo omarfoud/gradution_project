@@ -237,3 +237,40 @@ def test_company_find_candidates_idor_prevention(client):
         headers={"Authorization": "Bearer token"}
     )
     assert res.status_code == 403
+
+
+def test_company_context_idor_enforced_when_auth_disabled_but_token_provided(client, monkeypatch):
+    # Even if REQUIRE_AUTH is False, if a token is provided (so sub is populated),
+    # the IDOR check must still fire and reject mismatching company user ID
+    monkeypatch.setattr(main, "REQUIRE_AUTH", False)
+    mock_cursor_data["fetchone_values"] = [
+        ("comp_2", "OtherCorp", "Finance", "https://other.com", "Second St", "Giza", None, "company_user_other")
+    ]
+
+    res = client.post(
+        "/chat/company/message",
+        json={"company_user_id": "company_user_1", "company_id": "comp_2", "message": "hello"},
+        headers={"Authorization": "Bearer token"}
+    )
+    assert res.status_code == 403
+    assert "access to this company context" in res.json()["detail"]
+
+
+def test_company_endpoints_unauthenticated_allowed_when_auth_disabled(client, monkeypatch):
+    # If REQUIRE_AUTH is False and no token is provided, access is allowed without auth check
+    monkeypatch.setattr(main, "REQUIRE_AUTH", False)
+    mock_cursor_data["fetchone_values"] = [
+        ("comp_1", "Acme", "Tech", "https://acme.com", "Main St", "Cairo", "https://acme.com/logo.png", "company_user_1"),
+        (10,),
+    ]
+    mock_cursor_data["fetchall_values"] = [
+        [("Applied", 6), ("Interview", 4)],
+        [("job_1", "Data Engineer", 10)]
+    ]
+
+    res = client.post(
+        "/chat/company/message",
+        json={"company_user_id": "company_user_1", "message": "hello"}
+    )
+    assert res.status_code == 200
+    assert res.json()["company"]["company_id"] == "comp_1"

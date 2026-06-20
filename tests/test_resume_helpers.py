@@ -55,6 +55,16 @@ sys.modules.setdefault("jwt",jwt_mod)
 
 import main
 from fastapi import HTTPException
+import socket
+
+@pytest.fixture(autouse=True)
+def mock_dns(monkeypatch):
+    original_gai = socket.getaddrinfo
+    def fake_gai(host, port, *args, **kwargs):
+        if host == "example.com":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', port or 0))]
+        return original_gai(host, port, *args, **kwargs)
+    monkeypatch.setattr(socket, "getaddrinfo", fake_gai)
 
 
 def test_extract_text_rejects_unknown_extension():

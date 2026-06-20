@@ -111,6 +111,18 @@ The AI backend will:
 If the same `JobID` is synced again, SQLite points that job to the newest vector. Older orphan vectors may remain in FAISS, but they are ignored because they no longer have a matching row in `jobs.db`.
 
 
+## Live Resume Cache Invalidation
+
+To ensure candidate match scores and chats reflect the latest resume immediately after a candidate uploads a new CV, the main backend should invalidate the AI backend's cache for that user:
+
+```http
+POST /admin/invalidate-resume-cache?user_id=<USER_ID>
+X-Admin-API-Key: <ADMIN_API_KEY>
+```
+
+The AI backend will evict the cached text representation for the given `user_id`, ensuring any subsequent candidate reviews pull and parse the updated file.
+
+
 ## Scaling & Replica Constraints
 
 > [!WARNING]
