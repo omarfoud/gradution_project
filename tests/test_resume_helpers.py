@@ -101,6 +101,20 @@ def test_load_resume_bytes_http_failure(monkeypatch):
     assert exc.value.status_code == 502
 
 
+def test_load_resume_bytes_http_error_handling(monkeypatch):
+    class DummyErrorResponse:
+        content = b""
+        is_redirect = False
+        status_code = 404
+        def raise_for_status(self):
+            raise main.requests.exceptions.HTTPError("404 Client Error")
+    monkeypatch.setattr(main.requests, "get", lambda url, **kwargs: DummyErrorResponse())
+    with pytest.raises(HTTPException) as exc:
+        main.load_resume_bytes("https://example.com/resume.pdf")
+    assert exc.value.status_code == 502
+    assert "Failed to download resume" in exc.value.detail
+
+
 def test_load_resume_bytes_local_disallowed(monkeypatch):
     monkeypatch.setattr(main, "REQUIRE_REMOTE_RESUME_URL", True)
     with pytest.raises(HTTPException) as exc:

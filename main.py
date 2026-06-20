@@ -342,18 +342,16 @@ def load_resume_bytes(resume_path: str) -> bytes:
             _validate_url_and_ips(url)
             try:
                 response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=False)
+                if response.is_redirect or response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("Location")
+                    if not location:
+                        raise HTTPException(status_code=502, detail="Redirect response missing Location header")
+                    url = urljoin(url, location)
+                    continue
+                response.raise_for_status()
+                return response.content
             except requests.RequestException as exc:
                 raise HTTPException(status_code=502, detail=f"Failed to download resume: {exc}") from exc
-
-            if response.is_redirect or response.status_code in (301, 302, 303, 307, 308):
-                location = response.headers.get("Location")
-                if not location:
-                    raise HTTPException(status_code=502, detail="Redirect response missing Location header")
-                url = urljoin(url, location)
-                continue
-
-            response.raise_for_status()
-            return response.content
         raise HTTPException(status_code=400, detail="Too many redirects")
 
     if REQUIRE_REMOTE_RESUME_URL:
