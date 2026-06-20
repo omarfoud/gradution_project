@@ -1,8 +1,14 @@
+import os
+os.environ["JWT_SECRET"] = "test-jwt-secret-key-1234567890-test"
+os.environ["ADMIN_API_KEY"] = "test-admin-api-key-1234567890-test"
+os.environ["TESTING"] = "true"
+
 import asyncio
 import httpx
 import pytest
 import sys
 import types
+
 
 # ---- Stub heavy dependencies that need real hardware ----
 # Stub sentence_transformers
@@ -34,6 +40,7 @@ faiss_mod.METRIC_INNER_PRODUCT = 0
 faiss_mod.normalize_L2 = lambda x: None
 faiss_mod.read_index = lambda path: FakeIndex()
 faiss_mod.write_index = lambda idx, path: None
+faiss_mod.clone_index = lambda idx: idx
 sys.modules["faiss"] = faiss_mod
 
 # Stub google.generativeai
@@ -108,7 +115,7 @@ def test_health_ok(client):
 
 
 def test_clear_cache_ok(client):
-    res = client.post("/clear-cache")
+    res = client.post("/clear-cache", headers={"X-Admin-API-Key": "test-admin-api-key-1234567890-test"})
     assert res.status_code == 200
     assert res.json()["status"] == "cache cleared"
 

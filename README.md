@@ -110,6 +110,13 @@ The AI backend will:
 
 If the same `JobID` is synced again, SQLite points that job to the newest vector. Older orphan vectors may remain in FAISS, but they are ignored because they no longer have a matching row in `jobs.db`.
 
+
+## Scaling & Replica Constraints
+
+> [!WARNING]
+> This service is designed to run as a **single replica (single instance)**.
+> Because the FAISS index and local metadata are stored in files (`jobs.index` and `jobs.db`) local to the container instance, calls to `/admin/sync-job-embedding` only update the specific container instance receiving the request. Horizontally scaling to multiple replicas without a shared vector store / centralized DB (e.g. pgvector, Qdrant) or a pub/sub sync mechanism will lead to search result inconsistency between replicas.
+
 ## Docker Search Artifacts
 
 This deployment keeps the image small and downloads the search artifacts at container startup:

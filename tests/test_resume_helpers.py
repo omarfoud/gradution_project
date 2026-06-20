@@ -1,9 +1,14 @@
-import io
 import os
+os.environ["JWT_SECRET"] = "test-jwt-secret-key-1234567890-test"
+os.environ["ADMIN_API_KEY"] = "test-admin-api-key-1234567890-test"
+os.environ["TESTING"] = "true"
+
+import io
 import sys
 import types
 from pathlib import Path
 import pytest
+
 
 # Same stubs as above
 st_mod = types.ModuleType("sentence_transformers")
@@ -25,6 +30,7 @@ class FakeIdx:
 faiss_mod.IndexFlatIP=FakeIdx; faiss_mod.IndexIVFFlat=FakeIdx
 faiss_mod.METRIC_INNER_PRODUCT=0; faiss_mod.normalize_L2=lambda x:None
 faiss_mod.read_index=lambda p:FakeIdx(); faiss_mod.write_index=lambda i,p:None
+faiss_mod.clone_index=lambda i:i
 sys.modules.setdefault("faiss", faiss_mod)
 
 gmod=types.ModuleType("google"); gnmod=types.ModuleType("google.generativeai")

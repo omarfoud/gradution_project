@@ -1,8 +1,11 @@
 import concurrent.futures
 import io
+import ipaddress
 import logging
 import os
 import re
+import socket
+from urllib.parse import urlparse
 import sqlite3
 import threading
 from contextlib import asynccontextmanager
@@ -48,12 +51,24 @@ SQL_ENCRYPT = os.getenv("SQL_ENCRYPT", "yes")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-key")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").lower() in ("true", "1", "yes")
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() in ("true", "1", "yes")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
-if not ADMIN_API_KEY:
-    logger.warning(
-        "ADMIN_API_KEY is not set. /clear-cache endpoint is unauthenticated. "
-        "Set ADMIN_API_KEY in .env to protect it."
+
+INSECURE_PLACEHOLDERS = {
+    "super-secret-key",
+    "change-this-to-a-long-random-string",
+    "change-me",
+    "your_jwt_secret",
+}
+
+if not JWT_SECRET or JWT_SECRET.strip() in INSECURE_PLACEHOLDERS:
+    raise RuntimeError(
+        "CRITICAL SECURITY ERROR: JWT_SECRET must be set to a secure, non-placeholder value."
+    )
+
+if not ADMIN_API_KEY or ADMIN_API_KEY.strip() in INSECURE_PLACEHOLDERS:
+    raise RuntimeError(
+        "CRITICAL SECURITY ERROR: ADMIN_API_KEY must be set to a secure, non-placeholder value."
     )
 
 
@@ -71,6 +86,7 @@ JOB_POSTING_TABLE = get_sql_identifier("SQL_TABLE_JOB_POSTING", "JobPostings")
 APPLICATION_TABLE = get_sql_identifier("SQL_TABLE_APPLICATION", "Applications")
 
 ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
+ALLOWED_RESUME_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_RESUME_DOMAINS", "").split(",") if d.strip()]
 
 FAISS_TOP_K = int(os.getenv("FAISS_TOP_K", "500"))
 RESULTS_LIMIT = int(os.getenv("RESULTS_LIMIT", "10"))
@@ -82,6 +98,8 @@ REQUIRE_REMOTE_RESUME_URL = os.getenv("REQUIRE_REMOTE_RESUME_URL", "true").lower
 MODEL: Optional[SentenceTransformer] = None
 INDEX = None
 INDEX_LOCK = threading.RLock()
+INDEX_DIRTY = False
+INDEX_AUTOSAVE_ACTIVE = True
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -89,9 +107,30 @@ else:
     logger.warning("GEMINI_API_KEY is not configured.")
 
 
+def faiss_index_autosave_worker():
+    global INDEX_DIRTY, INDEX_AUTOSAVE_ACTIVE, INDEX
+    import time
+    logger.info("FAISS index autosave worker started.")
+    while INDEX_AUTOSAVE_ACTIVE:
+        time.sleep(30)
+        if INDEX_DIRTY and INDEX is not None:
+            try:
+                with INDEX_LOCK:
+                    cloned_index = faiss.clone_index(INDEX)
+                    INDEX_DIRTY = False
+                logger.info("Asynchronously saving FAISS index to %s...", INDEX_PATH)
+                Path(INDEX_PATH).parent.mkdir(parents=True, exist_ok=True)
+                faiss.write_index(cloned_index, INDEX_PATH)
+                logger.info("FAISS index saved successfully.")
+            except Exception as exc:
+                logger.error("Failed to save FAISS index asynchronously: %s", exc)
+                INDEX_DIRTY = True
+    logger.info("FAISS index autosave worker stopped.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global MODEL, INDEX
+    global MODEL, INDEX, INDEX_AUTOSAVE_ACTIVE, INDEX_DIRTY
     try:
         logger.info("Loading embedding model: %s on %s", MODEL_NAME, DEVICE)
         MODEL = SentenceTransformer(MODEL_NAME, device=DEVICE)
@@ -109,8 +148,23 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.error("FAILED to load FAISS index '%s': %s", INDEX_PATH, exc, exc_info=True)
             INDEX = None
+
+    INDEX_AUTOSAVE_ACTIVE = True
+    t = threading.Thread(target=faiss_index_autosave_worker, daemon=True)
+    t.start()
+
     logger.info("Backend is ready")
     yield
+
+    logger.info("Shutting down backend, stopping autosave worker...")
+    INDEX_AUTOSAVE_ACTIVE = False
+    if INDEX_DIRTY and INDEX is not None:
+        logger.info("Saving dirty FAISS index to disk before shutdown...")
+        try:
+            faiss.write_index(INDEX, INDEX_PATH)
+            logger.info("FAISS index saved successfully on shutdown.")
+        except Exception as exc:
+            logger.error("Failed to save FAISS index on shutdown: %s", exc)
 
 
 app = FastAPI(title="Job Assistant API", version="4.0.0", lifespan=lifespan)
@@ -231,8 +285,50 @@ def get_resume_path_by_user_id(user_id: str) -> str:
     return str(row[0])
 
 
+def is_safe_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+
+        hostname_lower = hostname.lower()
+
+        if ALLOWED_RESUME_DOMAINS:
+            domain_allowed = False
+            for allowed_domain in ALLOWED_RESUME_DOMAINS:
+                if hostname_lower == allowed_domain or hostname_lower.endswith("." + allowed_domain):
+                    domain_allowed = True
+                    break
+            if not domain_allowed:
+                return False
+
+        ips = socket.getaddrinfo(hostname, None)
+        for ip_info in ips:
+            ip_str = ip_info[4][0]
+            if "%" in ip_str:
+                ip_str = ip_str.split("%")[0]
+            ip = ipaddress.ip_address(ip_str)
+            if (
+                ip.is_private or
+                ip.is_loopback or
+                ip.is_link_local or
+                ip.is_multicast or
+                ip.is_reserved or
+                ip.is_unspecified
+            ):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def load_resume_bytes(resume_path: str) -> bytes:
     if resume_path.startswith(("http://", "https://")):
+        if not is_safe_url(resume_path):
+            raise HTTPException(status_code=400, detail="Unsafe resume URL detected (SSRF protection block)")
         try:
             response = requests.get(resume_path, timeout=REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
@@ -253,15 +349,33 @@ def load_resume_bytes(resume_path: str) -> bytes:
 def extract_text(file_content: bytes, filename: str) -> str:
     lower_name = filename.lower().split("?")[0]
     is_pdf = lower_name.endswith(".pdf") or file_content.startswith(b"%PDF")
-    is_docx = lower_name.endswith(".docx") or file_content.startswith(b"PK\x03\x04")
+    
+    is_docx = False
+    if lower_name.endswith(".docx"):
+        is_docx = True
+    elif file_content.startswith(b"PK\x03\x04"):
+        import zipfile
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_content)) as zf:
+                if "word/document.xml" in zf.namelist():
+                    is_docx = True
+        except Exception:
+            pass
+
     is_html = file_content.startswith(b"<") or b"html" in file_content[:200].lower()
     try:
         if is_pdf:
-            reader = PyPDF2.PdfReader(io.BytesIO(file_content))
-            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+            try:
+                reader = PyPDF2.PdfReader(io.BytesIO(file_content))
+                text = "\n".join((page.extract_text() or "") for page in reader.pages)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Failed to parse PDF file. Ensure it is a valid, uncorrupted PDF document. Error: {exc}")
         elif is_docx:
-            document = docx.Document(io.BytesIO(file_content))
-            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+            try:
+                document = docx.Document(io.BytesIO(file_content))
+                text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Failed to parse DOCX file. Ensure it is a valid, uncorrupted Word document. Error: {exc}")
         elif is_html:
             raise HTTPException(status_code=502, detail="Resume URL returned HTML, not a PDF/DOCX (possibly due to an authorization wall, redirect, or 404 error)")
         else:
@@ -358,7 +472,7 @@ def build_search_job_text(job: dict) -> str:
 
 
 def upsert_job_embedding(job: dict) -> dict:
-    global INDEX
+    global INDEX, INDEX_DIRTY
     if MODEL is None:
         raise HTTPException(status_code=503, detail="Embedding model is not loaded yet.")
     if INDEX is None:
@@ -374,6 +488,7 @@ def upsert_job_embedding(job: dict) -> dict:
         faiss.normalize_L2(vector)
         faiss_id = int(getattr(INDEX, "ntotal", 0))
         INDEX.add(vector)
+        INDEX_DIRTY = True
 
         conn = get_jobs_db()
         try:
@@ -405,8 +520,9 @@ def upsert_job_embedding(job: dict) -> dict:
         finally:
             conn.close()
 
-        Path(INDEX_PATH).parent.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(INDEX, INDEX_PATH)
+        if os.getenv("TESTING") == "true":
+            Path(INDEX_PATH).parent.mkdir(parents=True, exist_ok=True)
+            faiss.write_index(INDEX, INDEX_PATH)
 
     encode_query_cached.cache_clear()
     return {"job_id": job_id, "faiss_id": faiss_id, "index_total": int(getattr(INDEX, "ntotal", faiss_id + 1))}
@@ -418,7 +534,17 @@ def search_hybrid(query_text: str, *, k: int = RESULTS_LIMIT, location: Optional
     if not os.path.exists(DB_PATH):
         raise HTTPException(status_code=503, detail="jobs.db is missing.")
     vector = encode_query_cached(query_text.strip())
-    distances, indices = INDEX.search(vector, FAISS_TOP_K)
+    
+    search_k = FAISS_TOP_K
+    if location or work_type or experience:
+        search_k = max(search_k, 2000)
+    ntotal = int(getattr(INDEX, "ntotal", 0))
+    if ntotal > 0:
+        search_k = min(search_k, ntotal)
+
+    with INDEX_LOCK:
+        distances, indices = INDEX.search(vector, search_k)
+        
     valid_ids = [int(idx) for idx in indices[0] if idx != -1]
     if not valid_ids:
         return []
@@ -447,7 +573,19 @@ def search_hybrid(query_text: str, *, k: int = RESULTS_LIMIT, location: Optional
 
 
 def build_analysis_prompt(job_row: sqlite3.Row, resume_text: str) -> str:
-    return f"""You are an expert career-matching assistant.\nJob:\n- Title: {job_row['title']}\nCandidate CV:\n{resume_text[:2200]}\nReturn: 1. Match % 2. Why 3. Strengths 4. Gaps 5. Plan""".strip()
+    job_details = f"""
+- Title: {job_row['title']}
+- Company: {job_row['company']}
+- Location: {job_row['location']}
+- Work Type: {job_row['work_type']}
+- Experience: {job_row['experience']}
+- Salary Range: {job_row['salary_range']}
+- Skills: {job_row['skills']}
+- Qualifications: {job_row['qualifications']}
+- Responsibilities: {job_row['responsibilities']}
+- Description: {job_row['description']}
+""".strip()
+    return f"You are an expert career-matching assistant.\n\nJob details:\n{job_details}\n\nCandidate CV:\n{resume_text[:2200]}\n\nReturn:\n1. Match %\n2. Why\n3. Strengths\n4. Gaps\n5. Plan".strip()
 
 
 def generate_text(prompt: str) -> str:
@@ -461,24 +599,32 @@ def generate_text(prompt: str) -> str:
         raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
 
 
-def ensure_company_context(company_user_id: Optional[str], company_id: Optional[str]) -> dict:
-    if not company_user_id and company_id is None:
+def ensure_company_context(company_user_id: Optional[str], company_id: Optional[str], sub: Optional[str] = None) -> dict:
+    if not company_user_id and company_id is None and not sub:
         raise HTTPException(status_code=400, detail="Send company_user_id from logged-in company session or company_id for local testing")
     conn = get_app_db()
     try:
         cursor = conn.cursor()
         if company_id is not None:
             cursor.execute(f"SELECT TOP 1 CompanyID, Name, Industry, WebsiteURL, HeadquarterAddress, Location, LogoUrl, UserId FROM {COMPANY_TABLE} WHERE CompanyID = ?", str(company_id))
-        else:
+        elif company_user_id is not None:
             cursor.execute(f"SELECT TOP 1 CompanyID, Name, Industry, WebsiteURL, HeadquarterAddress, Location, LogoUrl, UserId FROM {COMPANY_TABLE} WHERE UserId = ?", company_user_id)
+        else:
+            cursor.execute(f"SELECT TOP 1 CompanyID, Name, Industry, WebsiteURL, HeadquarterAddress, Location, LogoUrl, UserId FROM {COMPANY_TABLE} WHERE UserId = ?", sub)
         row = cursor.fetchone()
     except pyodbc.Error as exc:
         raise HTTPException(status_code=500, detail=f"Company lookup failed: {exc}") from exc
     finally:
         conn.close()
     if not row:
-        raise HTTPException(status_code=404, detail="Company not found for this logged-in user")
-    return {"company_id": str(row[0]), "name": row[1], "industry": row[2], "website_url": row[3], "headquarter_address": row[4], "location": row[5], "logo_url": row[6], "user_id": row[7]}
+        raise HTTPException(status_code=404, detail="Company not found")
+    company = {"company_id": str(row[0]), "name": row[1], "industry": row[2], "website_url": row[3], "headquarter_address": row[4], "location": row[5], "logo_url": row[6], "user_id": row[7]}
+    
+    if REQUIRE_AUTH and sub is not None:
+        if str(company["user_id"]) != str(sub):
+            raise HTTPException(status_code=403, detail="Forbidden: You do not have access to this company context")
+            
+    return company
 
 
 def get_company_job_posting(company_id: str, job_posting_id: str) -> dict:
@@ -507,9 +653,35 @@ def get_company_kpis(company_id: str, job_posting_id: Optional[str] = None) -> d
     conn = get_app_db()
     try:
         cursor = conn.cursor()
-        cursor.execute(f"SELECT COUNT(*) FROM {APPLICATION_TABLE} a JOIN {JOB_POSTING_TABLE} jp ON jp.JobID = a.JobPostingID WHERE jp.CompanyID = ?", str(company_id))
+        
+        q_count = f"SELECT COUNT(*) FROM {APPLICATION_TABLE} a JOIN {JOB_POSTING_TABLE} jp ON jp.JobID = a.JobPostingID WHERE jp.CompanyID = ?"
+        params = [str(company_id)]
+        if job_posting_id:
+            q_count += " AND jp.JobID = ?"
+            params.append(str(job_posting_id))
+        cursor.execute(q_count, params)
         applications_count = int(cursor.fetchone()[0])
-        return {"applications_count": applications_count, "status_breakdown": [], "top_jobs": []}
+        
+        q_status = f"SELECT a.ApplicationStatus, COUNT(*) FROM {APPLICATION_TABLE} a JOIN {JOB_POSTING_TABLE} jp ON jp.JobID = a.JobPostingID WHERE jp.CompanyID = ?"
+        params_status = [str(company_id)]
+        if job_posting_id:
+            q_status += " AND jp.JobID = ?"
+            params_status.append(str(job_posting_id))
+        q_status += " GROUP BY a.ApplicationStatus"
+        cursor.execute(q_status, params_status)
+        status_rows = cursor.fetchall()
+        status_breakdown = [{"status": str(r[0]) if r[0] is not None else "Unknown", "count": int(r[1])} for r in status_rows]
+        
+        q_top = f"SELECT TOP 5 jp.JobID, jp.Title, COUNT(*) AS app_count FROM {APPLICATION_TABLE} a JOIN {JOB_POSTING_TABLE} jp ON jp.JobID = a.JobPostingID WHERE jp.CompanyID = ? GROUP BY jp.JobID, jp.Title ORDER BY app_count DESC"
+        cursor.execute(q_top, str(company_id))
+        top_rows = cursor.fetchall()
+        top_jobs = [{"job_id": str(r[0]), "title": str(r[1]), "applications_count": int(r[2])} for r in top_rows]
+        
+        return {
+            "applications_count": applications_count,
+            "status_breakdown": status_breakdown,
+            "top_jobs": top_jobs
+        }
     except pyodbc.Error as exc:
         raise HTTPException(status_code=500, detail=f"Company KPI query failed: {exc}") from exc
     finally:
@@ -645,10 +817,14 @@ def add_resume_previews_and_match_scores(job: dict, candidates: list[dict]) -> l
         computed_score = calculate_cv_match_score(job_text, resume_preview)
         return {**candidate, "resume_preview": resume_preview, "match_score": computed_score}
     max_workers = min(len(candidates), 10) if candidates else 1
+    import math
+    num_batches = math.ceil(len(candidates) / max_workers) if candidates else 1
+    timeout_seconds = max(20.0, num_batches * 15.0)
+
     enriched_candidates = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(enrich_candidate, candidate) for candidate in candidates]
-        concurrent.futures.wait(futures, timeout=20.0)
+        concurrent.futures.wait(futures, timeout=timeout_seconds)
         for future, candidate in zip(futures, candidates):
             if future.done():
                 try:
@@ -656,6 +832,7 @@ def add_resume_previews_and_match_scores(job: dict, candidates: list[dict]) -> l
                 except Exception as exc:
                     enriched_candidates.append({**candidate, "resume_preview": f"Failed to fetch resume: {exc}", "match_score": 0})
             else:
+                future.cancel()
                 enriched_candidates.append({**candidate, "resume_preview": "Failed to fetch resume: Request timed out", "match_score": 0})
     return sorted(enriched_candidates, key=lambda item: item.get("match_score") or 0, reverse=True)
 
@@ -762,8 +939,9 @@ def chat_general(req: ChatRequest, authorization: Optional[str] = Header(None)):
 
 @app.post("/chat/company/message")
 def company_chat(req: CompanyChatRequest, authorization: Optional[str] = Header(None)):
-    check_auth(req.company_user_id, authorization)
-    company = ensure_company_context(req.company_user_id, req.company_id)
+    payload = check_auth(req.company_user_id, authorization)
+    sub = payload.get("sub") if payload else None
+    company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     job = get_company_job_posting(company["company_id"], req.job_posting_id) if req.job_posting_id else None
     kpis = get_company_kpis(company["company_id"], req.job_posting_id)
     reply = generate_text(build_company_chat_prompt(company, req.message, job=job, kpis=kpis))
@@ -772,8 +950,9 @@ def company_chat(req: CompanyChatRequest, authorization: Optional[str] = Header(
 
 @app.post("/chat/company/analyze-company")
 def analyze_company(req: CompanyContextRequest, authorization: Optional[str] = Header(None)):
-    check_auth(req.company_user_id, authorization)
-    company = ensure_company_context(req.company_user_id, req.company_id)
+    payload = check_auth(req.company_user_id, authorization)
+    sub = payload.get("sub") if payload else None
+    company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     kpis = get_company_kpis(company["company_id"])
     prompt = build_company_chat_prompt(company, "Analyze our company profile for hiring attractiveness.", kpis=kpis)
     return {"analysis": generate_text(prompt), "company": company, "kpis": kpis}
@@ -781,16 +960,18 @@ def analyze_company(req: CompanyContextRequest, authorization: Optional[str] = H
 
 @app.post("/chat/company/analyze-job-post")
 def analyze_company_job_post(req: CompanyJobPostRequest, authorization: Optional[str] = Header(None)):
-    check_auth(req.company_user_id, authorization)
-    company = ensure_company_context(req.company_user_id, req.company_id)
+    payload = check_auth(req.company_user_id, authorization)
+    sub = payload.get("sub") if payload else None
+    company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     job = get_company_job_posting(company["company_id"], req.job_posting_id)
     return {"analysis": generate_text(build_job_post_analysis_prompt(company, job)), "company": company, "job": job}
 
 
 @app.post("/chat/company/hiring-insights")
 def company_hiring_insights(req: CompanyHiringInsightsRequest, authorization: Optional[str] = Header(None)):
-    check_auth(req.company_user_id, authorization)
-    company = ensure_company_context(req.company_user_id, req.company_id)
+    payload = check_auth(req.company_user_id, authorization)
+    sub = payload.get("sub") if payload else None
+    company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     kpis = get_company_kpis(company["company_id"], req.job_posting_id)
     prompt = build_company_chat_prompt(company, "Turn these hiring KPIs into useful recruiter insights.", kpis=kpis)
     return {"insights": generate_text(prompt), "company": company, "kpis": kpis}
@@ -798,16 +979,18 @@ def company_hiring_insights(req: CompanyHiringInsightsRequest, authorization: Op
 
 @app.post("/chat/company/generate-job-post")
 def generate_company_job_post(req: CompanyGenerateJobPostRequest, authorization: Optional[str] = Header(None)):
-    check_auth(req.company_user_id, authorization)
-    company = ensure_company_context(req.company_user_id, req.company_id)
+    payload = check_auth(req.company_user_id, authorization)
+    sub = payload.get("sub") if payload else None
+    company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     prompt = f"Create a professional job post for {company['name']}.\nRole: {req.role}\nSkills: {req.skills}"
     return {"job_post": generate_text(prompt), "company": company}
 
 
 @app.post("/chat/company/find-candidates")
 def company_find_candidates(req: CompanyFindCandidatesRequest, authorization: Optional[str] = Header(None)):
-    check_auth(req.company_user_id, authorization)
-    company = ensure_company_context(req.company_user_id, req.company_id)
+    payload = check_auth(req.company_user_id, authorization)
+    sub = payload.get("sub") if payload else None
+    company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     job = get_company_job_posting(company["company_id"], req.job_posting_id)
     candidates = get_candidates_for_job(company["company_id"], req.job_posting_id, req.limit)
     if not candidates:
@@ -836,3 +1019,14 @@ def clear_cache(x_admin_key: Optional[str] = Header(None, alias="X-Admin-API-Key
     get_resume_text_for_user.cache_clear()
     encode_query_cached.cache_clear()
     return {"status": "cache cleared"}
+
+
+@app.post("/admin/invalidate-resume-cache")
+def invalidate_resume_cache(user_id: str, x_admin_key: Optional[str] = Header(None, alias="X-Admin-API-Key")):
+    require_admin_key(x_admin_key)
+    try:
+        get_resume_text_for_user.cache.pop((user_id,), None)
+    except Exception as exc:
+        logger.warning("Failed to invalidate resume cache for user_id=%s: %s", user_id, exc)
+        raise HTTPException(status_code=500, detail=f"Failed to invalidate cache: {exc}")
+    return {"status": "cache invalidated", "user_id": user_id}

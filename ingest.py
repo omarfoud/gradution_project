@@ -143,7 +143,11 @@ def setup_database() -> None:
             if not raw_job_id:
                 continue
             try:
-                job_id = int(float(raw_job_id))
+                val = float(raw_job_id)
+                if not val.is_integer():
+                    logger.warning("Skipping row with non-integral Job Id: %s", raw_job_id)
+                    continue
+                job_id = int(val)
             except ValueError:
                 logger.warning("Skipping row with invalid Job Id: %s", raw_job_id)
                 continue
