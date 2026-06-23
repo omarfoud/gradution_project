@@ -2,6 +2,7 @@
 # Exclude the Frontend UI from Docker Image
 # ==========================================
 index.html
+frontend/
 
 # Exclude large datasets and local artifact repos from the Docker image.
 *.db
