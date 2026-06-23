@@ -233,3 +233,37 @@ def test_upsert_job_embedding_writes_sqlite_and_index(monkeypatch, tmp_path):
         conn.close()
     assert row == (123, 100, "Backend Developer")
     assert index_path.exists()
+
+
+def test_upsert_job_embedding_accepts_guid_job_ids(monkeypatch, tmp_path):
+    db_path = tmp_path / "jobs.db"
+    index_path = tmp_path / "jobs.index"
+    fake_index = FakeIndex()
+    guid_job_id = "DA16524B-3634-4429-A1F0-4B8527100B79"
+    monkeypatch.setattr(main, "DB_PATH", str(db_path))
+    monkeypatch.setattr(main, "INDEX_PATH", str(index_path))
+    monkeypatch.setattr(main, "MODEL", FakeST())
+    monkeypatch.setattr(main, "INDEX", fake_index)
+    monkeypatch.setattr(main.faiss, "write_index", lambda index, path: index_path.write_text("index"))
+
+    result = main.upsert_job_embedding({
+        "job_id": guid_job_id,
+        "title": "Senior Interactions Architect",
+        "company": "Lockman and Sons",
+        "description": "<p>Design interaction systems</p>",
+        "qualifications": None,
+        "responsibilities": "<ul><li>Lead architecture</li></ul>",
+        "skills": None,
+        "experience": None,
+        "location": "Antigua and Barbuda",
+        "work_type": "[0]",
+        "salary_range": "300.00 - 3000.00",
+    })
+
+    assert result["job_id"] == guid_job_id
+    conn = main.sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT job_id, title, company FROM jobs WHERE job_id = ?", (guid_job_id,)).fetchone()
+    finally:
+        conn.close()
+    assert row == (guid_job_id, "Senior Interactions Architect", "Lockman and Sons")

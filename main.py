@@ -11,7 +11,7 @@ import threading
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import docx
 import faiss
@@ -189,7 +189,7 @@ class RecommendRequest(BaseModel):
 
 class AnalyzeJobRequest(BaseModel):
     user_id: str = Field(..., min_length=1)
-    job_id: int
+    job_id: Union[int, str]
 
 
 class SearchRequest(BaseModel):
@@ -474,11 +474,20 @@ def ensure_jobs_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def clean_embedding_text(value: object) -> str:
+    text = str(value or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\\s+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def build_search_job_text(job: dict) -> str:
     return " ".join(
-        str(value or "")
+        clean_embedding_text(value)
         for value in [
             job.get("title"),
+            job.get("company"),
             job.get("skills"),
             job.get("qualifications"),
             job.get("responsibilities"),
@@ -497,7 +506,7 @@ def upsert_job_embedding(job: dict) -> dict:
     if INDEX is None:
         raise HTTPException(status_code=503, detail="FAISS index is not loaded yet.")
 
-    job_id = int(job["job_id"])
+    job_id = job["job_id"]
     embed_text = build_search_job_text(job)
     if not embed_text:
         raise HTTPException(status_code=400, detail="Job does not contain enough text to embed.")
@@ -761,7 +770,7 @@ def fetch_sql_job_for_embedding(job_posting_id: str, company_id: Optional[str] =
         salary_range = f"{float(row[10]):.2f} - {float(row[11]):.2f}"
     work_type = str(row[9]) if row[9] is not None else ("Remote" if row[12] else None)
     return {
-        "job_id": int(row[0]),
+        "job_id": str(row[0]),
         "title": row[1],
         "company": row[2],
         "description": row[3],
@@ -791,7 +800,7 @@ def get_candidates_for_job(company_id: str, job_posting_id: str, limit: int) -> 
 
 
 def build_job_match_text(job: dict) -> str:
-    return " ".join(str(value or "") for value in [job.get("title"), job.get("description"), job.get("responsibilities"), job.get("job_type"), job.get("salary_range")]).strip()
+    return " ".join(clean_embedding_text(value) for value in [job.get("title"), job.get("description"), job.get("responsibilities"), job.get("job_type"), job.get("salary_range")]).strip()
 
 
 def keyword_match_score(job_text: str, resume_text: str) -> int:
