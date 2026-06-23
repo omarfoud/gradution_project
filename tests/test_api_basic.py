@@ -138,6 +138,23 @@ def test_chat_returns_reply(client):
     assert res.json()["reply"] == "ok"
 
 
+def test_chat_recommendation_request_returns_jobs(client):
+    res = client.post("/chat", json={"message": "recommend jobs for me", "user_id": "user-1"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["reply"] == "ok"
+    assert body["recommended_jobs"] == [{
+        "job_id": 1,
+        "title": "Data Scientist",
+        "company": "ACME",
+        "location": "Cairo",
+        "work_type": "remote",
+        "experience": "junior",
+        "salary_range": "",
+        "similarity_score": 0.9,
+    }]
+
+
 def test_recommend_matches_returns_summary_fields(client):
     res = client.post(
         "/recommend-matches",

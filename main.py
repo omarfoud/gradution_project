@@ -1,6 +1,7 @@
 import concurrent.futures
 import io
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -896,6 +897,48 @@ def build_candidates_prompt(company: dict, job: dict, candidates: list[dict]) ->
     return f"You are an AI recruiter assistant.\n{get_company_summary_for_prompt(company)}\nJob: {job}\nApplicants: {candidates}\nReturn ranked_candidates with match_score, strengths, gaps, recommendation.".strip()
 
 
+def summarize_recommended_jobs(jobs: list[dict]) -> list[dict]:
+    return [{
+        "job_id": j["job_id"],
+        "title": j["title"],
+        "company": j["company"],
+        "location": j["location"],
+        "work_type": j["work_type"],
+        "experience": j["experience"],
+        "salary_range": j["salary_range"],
+        "similarity_score": j["similarity_score"],
+    } for j in jobs]
+
+
+def is_recommendation_message(message: str) -> bool:
+    normalized = message.lower()
+    english_phrases = [
+        "recommend",
+        "recommendation",
+        "recommended for you",
+        "suggest jobs",
+        "job suggestions",
+        "job matches",
+        "matching jobs",
+        "suitable jobs",
+        "jobs for me",
+        "best jobs",
+    ]
+    arabic_phrases = [
+        "رشح",
+        "ترشح",
+        "ترشيح",
+        "وظائف مناسبة",
+        "وظايف مناسبة",
+        "شغل مناسب",
+        "فرص مناسبة",
+        "انسب وظائف",
+        "أفضل وظائف",
+        "افضل وظائف",
+    ]
+    return any(phrase in normalized for phrase in english_phrases + arabic_phrases)
+
+
 def require_admin_key(x_admin_key: Optional[str]) -> None:
     if ADMIN_API_KEY:
         if not x_admin_key or x_admin_key != ADMIN_API_KEY:
@@ -926,7 +969,7 @@ def recommend_matches(req: RecommendRequest, authorization: Optional[str] = Head
     check_auth(req.user_id, authorization)
     resume_text = get_resume_text_for_user(req.user_id)
     jobs = search_hybrid(resume_text, k=req.limit, location=req.location, work_type=req.work_type, experience=req.experience)
-    return {"jobs": [{"job_id": j["job_id"], "title": j["title"], "company": j["company"], "location": j["location"], "work_type": j["work_type"], "experience": j["experience"], "salary_range": j["salary_range"], "similarity_score": j["similarity_score"]} for j in jobs]}
+    return {"jobs": summarize_recommended_jobs(jobs)}
 
 
 @app.post("/analyze-job-id")
@@ -953,16 +996,29 @@ def search_jobs(req: SearchRequest, authorization: Optional[str] = Header(None))
 @app.post("/chat")
 def chat_general(req: ChatRequest, authorization: Optional[str] = Header(None)):
     resume_context = ""
+    recommendation_context = ""
+    recommended_jobs: list[dict] = []
     if req.user_id:
         check_auth(req.user_id, authorization)
         try:
             resume_text = get_resume_text_for_user(req.user_id)
             resume_context = f"\nCandidate CV context:\n{resume_text[:2200]}\n"
+            if is_recommendation_message(req.message):
+                jobs = search_hybrid(resume_text, k=5)
+                recommended_jobs = summarize_recommended_jobs(jobs)
+                recommendation_context = "\nRecommended jobs from the vector search result:\n" + json.dumps(recommended_jobs, ensure_ascii=False, indent=2) + "\n"
         except Exception as exc:
             logger.warning("Could not load resume for user_id=%s: %s", req.user_id, exc)
-    system_prompt = f"You are a helpful career coach. Answer clearly and briefly.{resume_context}\nUser message: {req.message}"
+    system_prompt = (
+        "You are a helpful career coach. Answer clearly and briefly."
+        " If recommended jobs are provided, use those exact jobs and mention why they fit the candidate."
+        f"{resume_context}{recommendation_context}\nUser message: {req.message}"
+    )
     reply = generate_text(system_prompt)
-    return {"reply": reply}
+    response = {"reply": reply}
+    if recommended_jobs:
+        response["recommended_jobs"] = recommended_jobs
+    return response
 
 
 @app.post("/chat/company/message")

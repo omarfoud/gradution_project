@@ -78,6 +78,8 @@ GET /health/app-db
 - `POST /admin/sync-job-embedding`
 - `POST /clear-cache`
 
+`POST /chat` is also recommendation-aware. When the applicant sends a message such as `recommend jobs for me` or `رشحلي وظائف مناسبة` and includes `user_id`, the response includes `recommended_jobs` using the same hybrid search logic as `POST /recommend-matches`. The frontend should render those jobs inside the chatbot, while the `Recommended for You` section can continue calling `POST /recommend-matches` directly.
+
 ## Production note
 
 `Resume.FilePath` should be an HTTP/HTTPS URL to a reachable PDF or DOCX file.

@@ -147,6 +147,33 @@ Content-Type: application/json
 }
 ```
 
+If the message asks for job recommendations, for example `"recommend jobs for me"` or `"رشحلي وظائف مناسبة"`, the backend now reuses the same recommendation search logic used by `POST /recommend-matches`.
+
+Recommended response shape:
+
+```json
+{
+  "reply": "The best matching roles for your CV are...",
+  "recommended_jobs": [
+    {
+      "job_id": 1585229071670743,
+      "title": "Data Scientist",
+      "company": "Intuit",
+      "location": "Remote",
+      "work_type": "Remote",
+      "experience": "Mid Level",
+      "salary_range": "",
+      "similarity_score": 0.6111
+    }
+  ]
+}
+```
+
+Frontend usage:
+
+- Use `POST /recommend-matches` directly for the `Recommended for You` page/section.
+- Use `POST /chat` for chatbot messages. When `recommended_jobs` exists, render those jobs inside the chat message as clickable job cards.
+
 ### Company Chatbot
 
 ```http
