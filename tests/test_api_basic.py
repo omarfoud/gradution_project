@@ -61,6 +61,7 @@ pyodbc_mod = types.ModuleType("pyodbc")
 class PyodbcError(Exception): pass
 pyodbc_mod.Error = PyodbcError
 pyodbc_mod.connect = lambda *a, **kw: (_ for _ in ()).throw(PyodbcError("no real db"))
+pyodbc_mod.Binary = lambda payload: payload
 sys.modules["pyodbc"] = pyodbc_mod
 
 # Stub jwt
@@ -91,6 +92,16 @@ def client(monkeypatch):
     monkeypatch.setattr(
         main, "search_hybrid",
         lambda query_text, **kwargs: [{
+            "job_id": 1, "faiss_id": 0, "title": "Data Scientist", "company": "ACME",
+            "description": "", "qualifications": "", "responsibilities": "",
+            "skills": "python", "experience": "junior", "location": "Cairo",
+            "work_type": "remote", "salary_range": "", "similarity_score": 0.9,
+        }],
+    )
+    monkeypatch.setattr(
+        main,
+        "recommend_jobs_for_user",
+        lambda user_id, **kwargs: [{
             "job_id": 1, "faiss_id": 0, "title": "Data Scientist", "company": "ACME",
             "description": "", "qualifications": "", "responsibilities": "",
             "skills": "python", "experience": "junior", "location": "Cairo",
@@ -166,6 +177,31 @@ def test_recommend_matches_returns_summary_fields(client):
     assert set(jobs[0].keys()) == {
         "job_id", "title", "company", "location", "work_type",
         "experience", "salary_range", "similarity_score",
+    }
+
+
+def test_sync_resume_embedding_endpoint(client, monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "sync_resume_embedding_for_user",
+        lambda user_id, force=False: {
+            "status": "synced",
+            "user_id": user_id,
+            "resume_id": "resume-1",
+            "dimension": 384,
+        },
+    )
+    res = client.post(
+        "/admin/sync-resume-embedding",
+        headers={"X-Admin-API-Key": "test-admin-api-key-1234567890-test"},
+        json={"user_id": "user-1", "force": True},
+    )
+    assert res.status_code == 200
+    assert res.json() == {
+        "status": "synced",
+        "user_id": "user-1",
+        "resume_id": "resume-1",
+        "dimension": 384,
     }
 
 

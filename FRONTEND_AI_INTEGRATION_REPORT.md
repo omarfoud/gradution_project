@@ -283,6 +283,29 @@ Content-Type: application/json
 
 Important: SQL Server `JobID` values can be GUID strings. The AI backend now supports GUID job ids for this sync endpoint.
 
+### Sync Applicant Resume Embedding After CV Upload
+
+After the main backend uploads or replaces an applicant CV and saves the active resume row, call:
+
+```http
+POST /admin/sync-resume-embedding
+X-Admin-API-Key: <ADMIN_API_KEY>
+Content-Type: application/json
+```
+
+```json
+{
+  "user_id": "d5ce65a3-599f-457a-8aef-cb2621f4146e",
+  "force": true
+}
+```
+
+The AI backend stores the CV vector in `dbo.ResumeEmbeddings` with:
+
+`UserId`, `ApplicantID`, `ResumeID`, `ResumePath`, `ModelName`, `Dimension`, `TextHash`, `Embedding`, `CreatedAt`, `UpdatedAt`.
+
+`POST /recommend-matches` and recommendation-aware `POST /chat` use this stored embedding first. If no row exists yet, the AI backend creates it automatically as a fallback.
+
 ### Cache Utilities
 
 ```http
@@ -301,6 +324,7 @@ The following were tested successfully against the connected SQL database and lo
 
 - `GET /health`: `200`
 - `GET /health/app-db`: `200`
+- `POST /admin/sync-resume-embedding`: `200`
 - `POST /search`: `200`
 - `POST /recommend-matches`: `200`
 - `POST /analyze-job-id`: `200`

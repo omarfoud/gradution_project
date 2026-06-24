@@ -1,4 +1,5 @@
 import concurrent.futures
+import hashlib
 import io
 import ipaddress
 import json
@@ -18,6 +19,7 @@ import docx
 import faiss
 import google.generativeai as genai
 import jwt
+import numpy as np
 import pyodbc
 import PyPDF2
 import requests
@@ -86,6 +88,7 @@ RESUME_TABLE = get_sql_identifier("SQL_TABLE_RESUME", "Resumes")
 COMPANY_TABLE = get_sql_identifier("SQL_TABLE_COMPANY", "Companies")
 JOB_POSTING_TABLE = get_sql_identifier("SQL_TABLE_JOB_POSTING", "JobPostings")
 APPLICATION_TABLE = get_sql_identifier("SQL_TABLE_APPLICATION", "Applications")
+RESUME_EMBEDDING_TABLE = get_sql_identifier("SQL_TABLE_RESUME_EMBEDDING", "ResumeEmbeddings")
 
 ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
 ALLOWED_RESUME_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_RESUME_DOMAINS", "").split(",") if d.strip()]
@@ -96,6 +99,7 @@ MAX_CV_CHARS = int(os.getenv("MAX_CV_CHARS", "4000"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
 SQL_BATCH_SIZE = int(os.getenv("SQL_BATCH_SIZE", "900"))
 REQUIRE_REMOTE_RESUME_URL = os.getenv("REQUIRE_REMOTE_RESUME_URL", "true").lower() in {"1", "true", "yes", "y"}
+MOCK_RESUME_PATH = os.getenv("MOCK_RESUME_PATH")
 
 MODEL: Optional[SentenceTransformer] = None
 INDEX = None
@@ -259,6 +263,11 @@ class SyncJobEmbeddingRequest(CompanyContextRequest):
     job_posting_id: str = Field(..., min_length=1)
 
 
+class SyncResumeEmbeddingRequest(BaseModel):
+    user_id: str = Field(..., min_length=1)
+    force: bool = False
+
+
 class CompanyHiringInsightsRequest(CompanyContextRequest):
     job_posting_id: Optional[str] = None
 
@@ -279,19 +288,41 @@ def get_app_db():
     return pyodbc.connect(conn_str, timeout=10)
 
 
-def get_resume_path_by_user_id(user_id: str) -> str:
+def get_resume_metadata_by_user_id(user_id: str) -> dict:
     conn = get_app_db()
     try:
         cursor = conn.cursor()
-        cursor.execute(f"SELECT TOP 1 r.FilePath FROM {APPLICANT_TABLE} a JOIN {RESUME_TABLE} r ON r.ApplicantID = a.ApplicantID WHERE a.UserId = ? AND r.IsActive = 1 ORDER BY r.UploadDate DESC", user_id)
+        cursor.execute(f"SELECT TOP 1 a.ApplicantID, r.ResumeID, r.FilePath, r.UploadDate FROM {APPLICANT_TABLE} a JOIN {RESUME_TABLE} r ON r.ApplicantID = a.ApplicantID WHERE a.UserId = ? AND r.IsActive = 1 ORDER BY r.UploadDate DESC", user_id)
         row = cursor.fetchone()
     except pyodbc.Error as exc:
         raise HTTPException(status_code=500, detail=f"SQL Server query failed: {exc}") from exc
     finally:
         conn.close()
-    if not row or not row[0]:
+    if not row:
         raise HTTPException(status_code=404, detail="Active resume not found for this user")
-    return str(row[0])
+    if len(row) == 1:
+        if not row[0]:
+            raise HTTPException(status_code=404, detail="Active resume not found for this user")
+        return {
+            "user_id": str(user_id),
+            "applicant_id": None,
+            "resume_id": None,
+            "resume_path": str(row[0]),
+            "upload_date": None,
+        }
+    if not row[2]:
+        raise HTTPException(status_code=404, detail="Active resume not found for this user")
+    return {
+        "user_id": str(user_id),
+        "applicant_id": str(row[0]) if row[0] is not None else None,
+        "resume_id": str(row[1]) if row[1] is not None else None,
+        "resume_path": str(row[2]),
+        "upload_date": str(row[3]) if row[3] is not None else None,
+    }
+
+
+def get_resume_path_by_user_id(user_id: str) -> str:
+    return get_resume_metadata_by_user_id(user_id)["resume_path"]
 
 
 def _validate_url_and_ips(url: str) -> str:
@@ -412,9 +443,170 @@ def extract_text(file_content: bytes, filename: str) -> str:
 
 @ttl_cache(maxsize=256, ttl=600)
 def get_resume_text_for_user(user_id: str) -> str:
-    resume_path = get_resume_path_by_user_id(user_id)
+    resume_path = MOCK_RESUME_PATH or get_resume_path_by_user_id(user_id)
     file_content = load_resume_bytes(resume_path)
     return extract_text(file_content, resume_path)
+
+
+def ensure_resume_embedding_table(conn) -> None:
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        IF OBJECT_ID(N'dbo.{RESUME_EMBEDDING_TABLE}', N'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.{RESUME_EMBEDDING_TABLE} (
+                UserId NVARCHAR(450) NOT NULL PRIMARY KEY,
+                ApplicantID NVARCHAR(64) NULL,
+                ResumeID NVARCHAR(64) NULL,
+                ResumePath NVARCHAR(2048) NOT NULL,
+                ModelName NVARCHAR(200) NOT NULL,
+                Dimension INT NOT NULL,
+                TextHash CHAR(64) NOT NULL,
+                Embedding VARBINARY(MAX) NOT NULL,
+                CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_{RESUME_EMBEDDING_TABLE}_CreatedAt DEFAULT SYSUTCDATETIME(),
+                UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_{RESUME_EMBEDDING_TABLE}_UpdatedAt DEFAULT SYSUTCDATETIME()
+            );
+            CREATE INDEX IX_{RESUME_EMBEDDING_TABLE}_ResumeID ON dbo.{RESUME_EMBEDDING_TABLE}(ResumeID);
+            CREATE INDEX IX_{RESUME_EMBEDDING_TABLE}_TextHash ON dbo.{RESUME_EMBEDDING_TABLE}(TextHash);
+        END
+        """
+    )
+    conn.commit()
+
+
+def embed_resume_text(resume_text: str) -> np.ndarray:
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Embedding model is not loaded yet.")
+    vector = MODEL.encode([resume_text], convert_to_numpy=True).astype("float32")
+    faiss.normalize_L2(vector)
+    return vector.copy()
+
+
+def vector_to_bytes(vector: np.ndarray) -> bytes:
+    return np.asarray(vector, dtype="float32").reshape(-1).tobytes()
+
+
+def bytes_to_vector(payload: bytes, dimension: int) -> np.ndarray:
+    vector = np.frombuffer(payload, dtype="float32")
+    if vector.size != dimension:
+        raise ValueError(f"Stored vector dimension mismatch: expected {dimension}, got {vector.size}")
+    return vector.reshape(1, dimension).copy()
+
+
+def sync_resume_embedding_for_user(user_id: str, *, force: bool = False) -> dict:
+    metadata = get_resume_metadata_by_user_id(user_id)
+    resume_path = MOCK_RESUME_PATH or metadata["resume_path"]
+    file_content = load_resume_bytes(resume_path)
+    resume_text = extract_text(file_content, resume_path)
+    text_hash = hashlib.sha256(resume_text.encode("utf-8")).hexdigest()
+
+    conn = get_app_db()
+    try:
+        ensure_resume_embedding_table(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT TextHash, ModelName FROM dbo.{RESUME_EMBEDDING_TABLE} WHERE UserId = ?",
+            str(user_id),
+        )
+        existing = cursor.fetchone()
+        if existing and not force and existing[0] == text_hash and existing[1] == MODEL_NAME:
+            return {
+                "user_id": str(user_id),
+                "resume_id": metadata["resume_id"],
+                "status": "already_synced",
+                "text_hash": text_hash,
+                "model_name": MODEL_NAME,
+            }
+
+        vector = embed_resume_text(resume_text)
+        dimension = int(vector.shape[1])
+        payload = vector_to_bytes(vector)
+        cursor.execute(
+            f"""
+            UPDATE dbo.{RESUME_EMBEDDING_TABLE}
+            SET ApplicantID = ?, ResumeID = ?, ResumePath = ?, ModelName = ?,
+                Dimension = ?, TextHash = ?, Embedding = ?, UpdatedAt = SYSUTCDATETIME()
+            WHERE UserId = ?
+            """,
+            metadata["applicant_id"],
+            metadata["resume_id"],
+            resume_path,
+            MODEL_NAME,
+            dimension,
+            text_hash,
+            pyodbc.Binary(payload),
+            str(user_id),
+        )
+        if cursor.rowcount == 0:
+            cursor.execute(
+                f"""
+                INSERT INTO dbo.{RESUME_EMBEDDING_TABLE}
+                    (UserId, ApplicantID, ResumeID, ResumePath, ModelName, Dimension, TextHash, Embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                str(user_id),
+                metadata["applicant_id"],
+                metadata["resume_id"],
+                resume_path,
+                MODEL_NAME,
+                dimension,
+                text_hash,
+                pyodbc.Binary(payload),
+            )
+        conn.commit()
+    except pyodbc.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Resume embedding sync failed: {exc}") from exc
+    finally:
+        conn.close()
+
+    get_resume_text_for_user.cache_clear()
+    return {
+        "user_id": str(user_id),
+        "applicant_id": metadata["applicant_id"],
+        "resume_id": metadata["resume_id"],
+        "resume_path": resume_path,
+        "status": "synced",
+        "text_hash": text_hash,
+        "model_name": MODEL_NAME,
+        "dimension": dimension,
+    }
+
+
+def get_stored_resume_embedding(user_id: str) -> Optional[np.ndarray]:
+    conn = get_app_db()
+    try:
+        ensure_resume_embedding_table(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT Embedding, Dimension, ModelName FROM dbo.{RESUME_EMBEDDING_TABLE} WHERE UserId = ?",
+            str(user_id),
+        )
+        row = cursor.fetchone()
+    except pyodbc.Error as exc:
+        logger.warning("Failed to read stored resume embedding for user_id=%s: %s", user_id, exc)
+        return None
+    finally:
+        conn.close()
+
+    if not row or not row[0] or row[2] != MODEL_NAME:
+        return None
+    try:
+        return bytes_to_vector(bytes(row[0]), int(row[1]))
+    except ValueError as exc:
+        logger.warning("Invalid stored resume embedding for user_id=%s: %s", user_id, exc)
+        return None
+
+
+def get_resume_vector_for_user(user_id: str) -> np.ndarray:
+    stored_vector = get_stored_resume_embedding(user_id)
+    if stored_vector is not None:
+        return stored_vector
+    sync_resume_embedding_for_user(user_id)
+    stored_vector = get_stored_resume_embedding(user_id)
+    if stored_vector is not None:
+        return stored_vector
+    resume_text = get_resume_text_for_user(user_id)
+    return embed_resume_text(resume_text)
 
 
 @lru_cache(maxsize=512)
@@ -557,13 +749,12 @@ def upsert_job_embedding(job: dict) -> dict:
     return {"job_id": job_id, "faiss_id": faiss_id, "index_total": int(getattr(INDEX, "ntotal", faiss_id + 1))}
 
 
-def search_hybrid(query_text: str, *, k: int = RESULTS_LIMIT, location: Optional[str] = None, work_type: Optional[str] = None, experience: Optional[str] = None):
+def search_hybrid_vector(vector: np.ndarray, *, k: int = RESULTS_LIMIT, location: Optional[str] = None, work_type: Optional[str] = None, experience: Optional[str] = None):
     if MODEL is None or INDEX is None:
         raise HTTPException(status_code=503, detail="FAISS search is not loaded yet.")
     if not os.path.exists(DB_PATH):
         raise HTTPException(status_code=503, detail="jobs.db is missing.")
-    vector = encode_query_cached(query_text.strip())
-    
+
     search_k = FAISS_TOP_K
     if location or work_type or experience:
         search_k = max(search_k, 2000)
@@ -601,6 +792,16 @@ def search_hybrid(query_text: str, *, k: int = RESULTS_LIMIT, location: Optional
     return results
 
 
+def search_hybrid(query_text: str, *, k: int = RESULTS_LIMIT, location: Optional[str] = None, work_type: Optional[str] = None, experience: Optional[str] = None):
+    vector = encode_query_cached(query_text.strip())
+    return search_hybrid_vector(vector, k=k, location=location, work_type=work_type, experience=experience)
+
+
+def recommend_jobs_for_user(user_id: str, *, k: int = RESULTS_LIMIT, location: Optional[str] = None, work_type: Optional[str] = None, experience: Optional[str] = None):
+    vector = get_resume_vector_for_user(user_id)
+    return search_hybrid_vector(vector, k=k, location=location, work_type=work_type, experience=experience)
+
+
 def build_analysis_prompt(job_row: sqlite3.Row, resume_text: str) -> str:
     job_details = f"""
 - Title: {job_row['title']}
@@ -626,6 +827,47 @@ def generate_text(prompt: str) -> str:
         return response.text or "No response generated."
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
+
+
+def generate_text_or_fallback(prompt: str, fallback: str) -> str:
+    try:
+        return generate_text(prompt)
+    except HTTPException as exc:
+        if exc.status_code == 502:
+            logger.warning("Using fallback text because LLM request failed: %s", exc.detail)
+            return fallback
+        raise
+
+
+def build_recommendation_reply_fallback(jobs: list[dict]) -> str:
+    if not jobs:
+        return "I could not find matching jobs right now."
+    lines = ["Here are the top matching jobs from your CV embedding:"]
+    for idx, job in enumerate(jobs[:5], 1):
+        score = job.get("similarity_score")
+        score_text = f" ({round(float(score) * 100)}% similarity)" if score is not None else ""
+        lines.append(f"{idx}. {job.get('title')} at {job.get('company')}{score_text}")
+    return "\n".join(lines)
+
+
+def build_analysis_fallback(job_row: sqlite3.Row, resume_text: str) -> str:
+    score = calculate_cv_match_score(build_job_match_text(dict(job_row)), resume_text)
+    return (
+        f"Match Score: {score}%\n"
+        f"Why: This fallback score is based on semantic similarity between the CV and the job text.\n"
+        f"Strengths: Skills and terms that overlap with the job requirements are counted positively.\n"
+        f"Gaps: Review the job requirements manually for missing tools, seniority, or domain-specific experience.\n"
+        f"Plan: Improve the CV by highlighting directly relevant projects, skills, and measurable outcomes for this role."
+    )
+
+
+def build_candidate_ranking_fallback(candidates: list[dict]) -> str:
+    if not candidates:
+        return "No applicants found for this job posting."
+    lines = ["AI candidate ranking fallback based on computed CV/job match scores:"]
+    for idx, candidate in enumerate(candidates[:10], 1):
+        lines.append(f"{idx}. {candidate.get('name') or 'Candidate'} - {candidate.get('match_score', 0)}% match")
+    return "\n".join(lines)
 
 
 def ensure_company_context(company_user_id: Optional[str], company_id: Optional[str], sub: Optional[str] = None) -> dict:
@@ -967,8 +1209,7 @@ def app_db_health_check():
 @app.post("/recommend-matches")
 def recommend_matches(req: RecommendRequest, authorization: Optional[str] = Header(None)):
     check_auth(req.user_id, authorization)
-    resume_text = get_resume_text_for_user(req.user_id)
-    jobs = search_hybrid(resume_text, k=req.limit, location=req.location, work_type=req.work_type, experience=req.experience)
+    jobs = recommend_jobs_for_user(req.user_id, k=req.limit, location=req.location, work_type=req.work_type, experience=req.experience)
     return {"jobs": summarize_recommended_jobs(jobs)}
 
 
@@ -983,7 +1224,7 @@ def analyze_job_id(req: AnalyzeJobRequest, authorization: Optional[str] = Header
         conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="Job ID not found")
-    return {"analysis": generate_text(build_analysis_prompt(row, resume_text))}
+    return {"analysis": generate_text_or_fallback(build_analysis_prompt(row, resume_text), build_analysis_fallback(row, resume_text))}
 
 
 @app.post("/search")
@@ -1004,7 +1245,7 @@ def chat_general(req: ChatRequest, authorization: Optional[str] = Header(None)):
             resume_text = get_resume_text_for_user(req.user_id)
             resume_context = f"\nCandidate CV context:\n{resume_text[:2200]}\n"
             if is_recommendation_message(req.message):
-                jobs = search_hybrid(resume_text, k=5)
+                jobs = recommend_jobs_for_user(req.user_id, k=5)
                 recommended_jobs = summarize_recommended_jobs(jobs)
                 recommendation_context = "\nRecommended jobs from the vector search result:\n" + json.dumps(recommended_jobs, ensure_ascii=False, indent=2) + "\n"
         except Exception as exc:
@@ -1014,7 +1255,8 @@ def chat_general(req: ChatRequest, authorization: Optional[str] = Header(None)):
         " If recommended jobs are provided, use those exact jobs and mention why they fit the candidate."
         f"{resume_context}{recommendation_context}\nUser message: {req.message}"
     )
-    reply = generate_text(system_prompt)
+    fallback_reply = build_recommendation_reply_fallback(recommended_jobs) if recommended_jobs else "AI text generation is temporarily unavailable. Please try again later."
+    reply = generate_text_or_fallback(system_prompt, fallback_reply)
     response = {"reply": reply}
     if recommended_jobs:
         response["recommended_jobs"] = recommended_jobs
@@ -1028,7 +1270,10 @@ def company_chat(req: CompanyChatRequest, authorization: Optional[str] = Header(
     company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     job = get_company_job_posting(company["company_id"], req.job_posting_id) if req.job_posting_id else None
     kpis = get_company_kpis(company["company_id"], req.job_posting_id)
-    reply = generate_text(build_company_chat_prompt(company, req.message, job=job, kpis=kpis))
+    reply = generate_text_or_fallback(
+        build_company_chat_prompt(company, req.message, job=job, kpis=kpis),
+        "AI text generation is temporarily unavailable, but the company and job context were loaded successfully.",
+    )
     return {"reply": reply, "company": company, "job": job, "kpis": kpis}
 
 
@@ -1039,7 +1284,7 @@ def analyze_company(req: CompanyContextRequest, authorization: Optional[str] = H
     company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     kpis = get_company_kpis(company["company_id"])
     prompt = build_company_chat_prompt(company, "Analyze our company profile for hiring attractiveness.", kpis=kpis)
-    return {"analysis": generate_text(prompt), "company": company, "kpis": kpis}
+    return {"analysis": generate_text_or_fallback(prompt, "Company context and hiring KPIs loaded successfully. LLM analysis is temporarily unavailable."), "company": company, "kpis": kpis}
 
 
 @app.post("/chat/company/analyze-job-post")
@@ -1048,7 +1293,7 @@ def analyze_company_job_post(req: CompanyJobPostRequest, authorization: Optional
     sub = payload.get("sub") if payload else None
     company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     job = get_company_job_posting(company["company_id"], req.job_posting_id)
-    return {"analysis": generate_text(build_job_post_analysis_prompt(company, job)), "company": company, "job": job}
+    return {"analysis": generate_text_or_fallback(build_job_post_analysis_prompt(company, job), "Job post context loaded successfully. LLM job-post analysis is temporarily unavailable."), "company": company, "job": job}
 
 
 @app.post("/chat/company/hiring-insights")
@@ -1058,7 +1303,7 @@ def company_hiring_insights(req: CompanyHiringInsightsRequest, authorization: Op
     company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     kpis = get_company_kpis(company["company_id"], req.job_posting_id)
     prompt = build_company_chat_prompt(company, "Turn these hiring KPIs into useful recruiter insights.", kpis=kpis)
-    return {"insights": generate_text(prompt), "company": company, "kpis": kpis}
+    return {"insights": generate_text_or_fallback(prompt, "Hiring KPI context loaded successfully. LLM insights are temporarily unavailable."), "company": company, "kpis": kpis}
 
 
 @app.post("/chat/company/generate-job-post")
@@ -1067,7 +1312,7 @@ def generate_company_job_post(req: CompanyGenerateJobPostRequest, authorization:
     sub = payload.get("sub") if payload else None
     company = ensure_company_context(req.company_user_id, req.company_id, sub=sub)
     prompt = f"Create a professional job post for {company['name']}.\nRole: {req.role}\nSkills: {req.skills}"
-    return {"job_post": generate_text(prompt), "company": company}
+    return {"job_post": generate_text_or_fallback(prompt, f"Draft job post fallback for {req.role}: describe responsibilities, requirements, skills ({', '.join(req.skills)}), work type, location, and salary range."), "company": company}
 
 
 @app.post("/chat/company/find-candidates")
@@ -1081,7 +1326,7 @@ def company_find_candidates(req: CompanyFindCandidatesRequest, authorization: Op
         return {"ranking": "No applicants found for this job posting.", "company": company, "job": job, "candidates": []}
     scored_candidates = add_resume_previews_and_match_scores(job, candidates)
     save_candidate_match_scores(scored_candidates)
-    ranking = generate_text(build_candidates_prompt(company, job, scored_candidates))
+    ranking = generate_text_or_fallback(build_candidates_prompt(company, job, scored_candidates), build_candidate_ranking_fallback(scored_candidates))
     public_candidates = [{k: v for k, v in c.items() if k not in {"resume_path", "resume_preview"}} for c in scored_candidates]
     return {"ranking": ranking, "company": company, "job": job, "candidates": public_candidates}
 
@@ -1097,6 +1342,13 @@ def sync_job_embedding(req: SyncJobEmbeddingRequest, x_admin_key: Optional[str] 
     return {"status": "synced", "job": job, **result}
 
 
+@app.post("/admin/sync-resume-embedding")
+def sync_resume_embedding(req: SyncResumeEmbeddingRequest, x_admin_key: Optional[str] = Header(None, alias="X-Admin-API-Key")):
+    require_admin_key(x_admin_key)
+    result = sync_resume_embedding_for_user(req.user_id, force=req.force)
+    return result
+
+
 @app.post("/clear-cache")
 def clear_cache(x_admin_key: Optional[str] = Header(None, alias="X-Admin-API-Key")):
     require_admin_key(x_admin_key)
@@ -1110,7 +1362,14 @@ def invalidate_resume_cache(user_id: str, x_admin_key: Optional[str] = Header(No
     require_admin_key(x_admin_key)
     try:
         get_resume_text_for_user.cache.pop((user_id,), None)
+        conn = get_app_db()
+        try:
+            ensure_resume_embedding_table(conn)
+            conn.cursor().execute(f"DELETE FROM dbo.{RESUME_EMBEDDING_TABLE} WHERE UserId = ?", str(user_id))
+            conn.commit()
+        finally:
+            conn.close()
     except Exception as exc:
         logger.warning("Failed to invalidate resume cache for user_id=%s: %s", user_id, exc)
         raise HTTPException(status_code=500, detail=f"Failed to invalidate cache: {exc}")
-    return {"status": "cache invalidated", "user_id": user_id}
+    return {"status": "cache invalidated", "resume_embedding": "deleted", "user_id": user_id}

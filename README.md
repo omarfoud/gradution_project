@@ -76,6 +76,7 @@ GET /health/app-db
 - `POST /search`
 - `POST /chat`
 - `POST /admin/sync-job-embedding`
+- `POST /admin/sync-resume-embedding`
 - `POST /clear-cache`
 
 `POST /chat` is also recommendation-aware. When the applicant sends a message such as `recommend jobs for me` or `رشحلي وظائف مناسبة` and includes `user_id`, the response includes `recommended_jobs` using the same hybrid search logic as `POST /recommend-matches`. The frontend should render those jobs inside the chatbot, while the `Recommended for You` section can continue calling `POST /recommend-matches` directly.
@@ -112,17 +113,48 @@ The AI backend will:
 
 If the same `JobID` is synced again, SQLite points that job to the newest vector. Older orphan vectors may remain in FAISS, but they are ignored because they no longer have a matching row in `jobs.db`.
 
+## Live Resume Embedding Sync
+
+When the main backend uploads or replaces an applicant CV, it should call the AI backend after the SQL resume record is saved:
+
+```http
+POST /admin/sync-resume-embedding
+X-Admin-API-Key: <ADMIN_API_KEY>
+Content-Type: application/json
+
+{
+  "user_id": "<APPLICANT_USER_ID>",
+  "force": true
+}
+```
+
+The AI backend will read the active resume from SQL Server, extract PDF/DOCX text, generate a normalized embedding, and store it in `dbo.ResumeEmbeddings`. `POST /recommend-matches` and recommendation-aware `POST /chat` use this stored CV embedding first, which avoids parsing and embedding the CV on every request.
+
+`dbo.ResumeEmbeddings` columns:
+
+- `UserId`
+- `ApplicantID`
+- `ResumeID`
+- `ResumePath`
+- `ModelName`
+- `Dimension`
+- `TextHash`
+- `Embedding`
+- `CreatedAt`
+- `UpdatedAt`
+
+If the stored embedding is missing, recommendations automatically create it as a fallback.
 
 ## Live Resume Cache Invalidation
 
-To ensure candidate match scores and chats reflect the latest resume immediately after a candidate uploads a new CV, the main backend should invalidate the AI backend's cache for that user:
+If the main backend cannot call the resume sync endpoint, it can still invalidate the AI backend cache after a candidate uploads a new CV:
 
 ```http
 POST /admin/invalidate-resume-cache?user_id=<USER_ID>
 X-Admin-API-Key: <ADMIN_API_KEY>
 ```
 
-The AI backend will evict the cached text representation for the given `user_id`, ensuring any subsequent candidate reviews pull and parse the updated file.
+The AI backend evicts the cached text representation and deletes the stored resume embedding for the given `user_id`, ensuring the next request pulls, parses, and re-embeds the updated file.
 
 
 ## Scaling & Replica Constraints
