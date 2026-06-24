@@ -79,7 +79,7 @@ GET /health/app-db
 - `POST /admin/sync-resume-embedding`
 - `POST /clear-cache`
 
-`POST /chat` is also recommendation-aware. When the applicant sends a message such as `recommend jobs for me` or `رشحلي وظائف مناسبة` and includes `user_id`, the response includes `recommended_jobs` using the same hybrid search logic as `POST /recommend-matches`. The frontend should render those jobs inside the chatbot, while the `Recommended for You` section can continue calling `POST /recommend-matches` directly.
+`POST /chat` is recommendation-aware. When the applicant sends a job-matching message such as `recommend jobs for me`, `find jobs that match my skills`, or `show me remote jobs` and includes `user_id`, the response includes `recommended_jobs` using the same hybrid search logic as `POST /recommend-matches`. Short greetings such as `hi` or `hello` return a lightweight greeting and do not inject CV context, so the chatbot does not unexpectedly analyze the resume. The frontend should render `recommended_jobs` inside the chatbot as job cards, while the `Recommended for You` section can continue calling `POST /recommend-matches` directly.
 
 ## Production note
 

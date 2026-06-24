@@ -1,4 +1,4 @@
-# Jobify AI Backend Frontend Integration Report
+﻿# Jobify AI Backend Frontend Integration Report
 
 ## Current Services
 
@@ -147,7 +147,7 @@ Content-Type: application/json
 }
 ```
 
-If the message asks for job recommendations, for example `"recommend jobs for me"` or `"رشحلي وظائف مناسبة"`, the backend now reuses the same recommendation search logic used by `POST /recommend-matches`.
+If the message asks for job recommendations, for example `"recommend jobs for me"`, `"Find jobs that match my skills"`, or `"show me remote jobs"`, the backend reuses the same recommendation search logic used by `POST /recommend-matches`. Short greetings such as `"hi"` and `"hello"` return a lightweight greeting and do not inject CV context, so the chatbot does not unexpectedly analyze the applicant resume.
 
 Recommended response shape:
 
@@ -173,6 +173,7 @@ Frontend usage:
 
 - Use `POST /recommend-matches` directly for the `Recommended for You` page/section.
 - Use `POST /chat` for chatbot messages. When `recommended_jobs` exists, render those jobs inside the chat message as clickable job cards.
+- Render bot replies with lightweight Markdown formatting so bullets and bold text do not appear as raw `*` or `**` characters.
 
 ### Company Chatbot
 

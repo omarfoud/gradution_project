@@ -1162,6 +1162,12 @@ def is_recommendation_message(message: str) -> bool:
         "job suggestions",
         "job matches",
         "matching jobs",
+        "find jobs",
+        "show me jobs",
+        "show me remote jobs",
+        "match my skills",
+        "match my cv",
+        "match my resume",
         "suitable jobs",
         "jobs for me",
         "best jobs",
@@ -1179,6 +1185,24 @@ def is_recommendation_message(message: str) -> bool:
         "افضل وظائف",
     ]
     return any(phrase in normalized for phrase in english_phrases + arabic_phrases)
+
+
+def is_greeting_message(message: str) -> bool:
+    normalized = re.sub(r"[^\w\s\u0600-\u06ff]", "", message.lower()).strip()
+    greetings = {
+        "hi",
+        "hello",
+        "hey",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "السلام عليكم",
+        "سلام",
+        "اهلا",
+        "اهلاً",
+        "هاي",
+    }
+    return normalized in greetings or len(normalized.split()) <= 2 and normalized in greetings
 
 
 def require_admin_key(x_admin_key: Optional[str]) -> None:
@@ -1239,19 +1263,31 @@ def chat_general(req: ChatRequest, authorization: Optional[str] = Header(None)):
     resume_context = ""
     recommendation_context = ""
     recommended_jobs: list[dict] = []
+    wants_recommendations = is_recommendation_message(req.message)
     if req.user_id:
         check_auth(req.user_id, authorization)
+    if is_greeting_message(req.message):
+        return {
+            "reply": (
+                "Hello! I can help with CV improvement, interview preparation, "
+                "career questions, and job recommendations based on your uploaded CV. "
+                "Ask me what you want to do next."
+            )
+        }
+    if req.user_id:
         try:
-            resume_text = get_resume_text_for_user(req.user_id)
-            resume_context = f"\nCandidate CV context:\n{resume_text[:2200]}\n"
-            if is_recommendation_message(req.message):
+            if wants_recommendations:
                 jobs = recommend_jobs_for_user(req.user_id, k=5)
                 recommended_jobs = summarize_recommended_jobs(jobs)
                 recommendation_context = "\nRecommended jobs from the vector search result:\n" + json.dumps(recommended_jobs, ensure_ascii=False, indent=2) + "\n"
+            else:
+                resume_text = get_resume_text_for_user(req.user_id)
+                resume_context = f"\nCandidate CV context:\n{resume_text[:2200]}\n"
         except Exception as exc:
             logger.warning("Could not load resume for user_id=%s: %s", req.user_id, exc)
     system_prompt = (
-        "You are a helpful career coach. Answer clearly and briefly."
+        "You are a helpful career coach. Answer clearly and briefly. "
+        "Use clean plain text with short sections and bullet points when useful."
         " If recommended jobs are provided, use those exact jobs and mention why they fit the candidate."
         f"{resume_context}{recommendation_context}\nUser message: {req.message}"
     )

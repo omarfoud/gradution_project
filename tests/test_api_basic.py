@@ -146,7 +146,15 @@ def test_search_returns_jobs(client):
 def test_chat_returns_reply(client):
     res = client.post("/chat", json={"message": "hello"})
     assert res.status_code == 200
-    assert res.json()["reply"] == "ok"
+    assert "job recommendations" in res.json()["reply"]
+
+
+def test_chat_greeting_with_user_id_does_not_use_cv_context(client):
+    res = client.post("/chat", json={"message": "hi", "user_id": "user-1"})
+    assert res.status_code == 200
+    body = res.json()
+    assert "job recommendations" in body["reply"]
+    assert "recommended_jobs" not in body
 
 
 def test_chat_recommendation_request_returns_jobs(client):
@@ -164,6 +172,15 @@ def test_chat_recommendation_request_returns_jobs(client):
         "salary_range": "",
         "similarity_score": 0.9,
     }]
+
+
+def test_chat_find_jobs_prompt_returns_recommendations(client):
+    res = client.post("/chat", json={"message": "Find jobs that match my skills", "user_id": "user-1"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["reply"] == "ok"
+    assert len(body["recommended_jobs"]) == 1
+    assert body["recommended_jobs"][0]["title"] == "Data Scientist"
 
 
 def test_recommend_matches_returns_summary_fields(client):
