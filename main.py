@@ -641,6 +641,23 @@ def fetch_jobs_by_faiss_ids(conn: sqlite3.Connection, faiss_ids: list[int], filt
     return rows
 
 
+def as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "featured"}
+    return False
+
+
+def get_job_featured_flag(job: dict) -> bool:
+    for key in ("isFeatured", "IsFeatured", "is_featured", "featured"):
+        if key in job:
+            return as_bool(job.get(key))
+    return False
+
+
 def ensure_jobs_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -656,14 +673,19 @@ def ensure_jobs_table(conn: sqlite3.Connection) -> None:
             experience TEXT,
             location TEXT,
             work_type TEXT,
-            salary_range TEXT
+            salary_range TEXT,
+            is_featured INTEGER DEFAULT 0
         )
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "is_featured" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN is_featured INTEGER DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_job_id ON jobs(job_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_location ON jobs(location)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_work_type ON jobs(work_type)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_experience ON jobs(experience)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_is_featured ON jobs(is_featured)")
     conn.commit()
 
 
@@ -719,8 +741,8 @@ def upsert_job_embedding(job: dict) -> dict:
                 INSERT OR REPLACE INTO jobs (
                     faiss_id, job_id, title, company, description,
                     qualifications, responsibilities, skills, experience,
-                    location, work_type, salary_range
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    location, work_type, salary_range, is_featured
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     faiss_id,
@@ -735,6 +757,7 @@ def upsert_job_embedding(job: dict) -> dict:
                     job.get("location"),
                     job.get("work_type"),
                     job.get("salary_range"),
+                    1 if get_job_featured_flag(job) else 0,
                 ),
             )
             conn.commit()
@@ -775,7 +798,13 @@ def search_hybrid_vector(vector: np.ndarray, *, k: int = RESULTS_LIMIT, location
         rows = fetch_jobs_by_faiss_ids(conn, valid_ids, {"location": location, "work_type": work_type, "experience": experience})
     finally:
         conn.close()
-    sorted_rows = sorted(rows, key=lambda r: id_to_rank.get(r["faiss_id"], 10**9))
+    sorted_rows = sorted(
+        rows,
+        key=lambda r: (
+            0 if as_bool(r["is_featured"]) else 1,
+            id_to_rank.get(r["faiss_id"], 10**9),
+        ),
+    )
     results = []
     seen = set()
     for row in sorted_rows:
@@ -785,6 +814,7 @@ def search_hybrid_vector(vector: np.ndarray, *, k: int = RESULTS_LIMIT, location
         item = dict(row)
         item["similarity_score"] = round(score_by_id.get(row["faiss_id"], 0.0), 4)
         item["embedding_source"] = "faiss_local"
+        item["isFeatured"] = as_bool(item.get("is_featured"))
         results.append(item)
         seen.add(job_id)
         if len(results) >= k:
@@ -972,6 +1002,7 @@ def fetch_sql_job_for_embedding(job_posting_id: str, company_id: Optional[str] =
         qualifications_expr = "jp.Qualifications" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Qualifications") else "CAST(NULL AS NVARCHAR(MAX))"
         skills_expr = "jp.Skills" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Skills") else "CAST(NULL AS NVARCHAR(MAX))"
         experience_expr = "jp.Experience" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Experience") else "CAST(NULL AS NVARCHAR(MAX))"
+        is_featured_expr = "jp.IsFeatured" if sql_column_exists(cursor, JOB_POSTING_TABLE, "IsFeatured") else "CAST(0 AS BIT)"
         where = "jp.JobID = ?"
         params = [str(job_posting_id)]
         if company_id is not None:
@@ -992,7 +1023,8 @@ def fetch_sql_job_for_embedding(job_posting_id: str, company_id: Optional[str] =
                 jp.JobTypes,
                 jp.MinSalary,
                 jp.MaxSalary,
-                jp.IsRemote
+                jp.IsRemote,
+                {is_featured_expr} AS IsFeatured
             FROM {JOB_POSTING_TABLE} jp
             LEFT JOIN {COMPANY_TABLE} c ON c.CompanyID = jp.CompanyID
             WHERE {where}
@@ -1024,6 +1056,7 @@ def fetch_sql_job_for_embedding(job_posting_id: str, company_id: Optional[str] =
         "location": row[8],
         "work_type": work_type,
         "salary_range": salary_range,
+        "isFeatured": as_bool(row[13]),
     }
 
 
@@ -1149,6 +1182,7 @@ def summarize_recommended_jobs(jobs: list[dict]) -> list[dict]:
         "experience": j["experience"],
         "salary_range": j["salary_range"],
         "similarity_score": j["similarity_score"],
+        "isFeatured": as_bool(j.get("isFeatured", j.get("is_featured"))),
     } for j in jobs]
 
 

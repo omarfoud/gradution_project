@@ -96,6 +96,7 @@ def client(monkeypatch):
             "description": "", "qualifications": "", "responsibilities": "",
             "skills": "python", "experience": "junior", "location": "Cairo",
             "work_type": "remote", "salary_range": "", "similarity_score": 0.9,
+            "isFeatured": False,
         }],
     )
     monkeypatch.setattr(
@@ -106,6 +107,7 @@ def client(monkeypatch):
             "description": "", "qualifications": "", "responsibilities": "",
             "skills": "python", "experience": "junior", "location": "Cairo",
             "work_type": "remote", "salary_range": "", "similarity_score": 0.9,
+            "isFeatured": False,
         }],
     )
     def fake_resume_text(user_id):
@@ -171,6 +173,7 @@ def test_chat_recommendation_request_returns_jobs(client):
         "experience": "junior",
         "salary_range": "",
         "similarity_score": 0.9,
+        "isFeatured": False,
     }]
 
 
@@ -193,7 +196,7 @@ def test_recommend_matches_returns_summary_fields(client):
     assert len(jobs) == 1
     assert set(jobs[0].keys()) == {
         "job_id", "title", "company", "location", "work_type",
-        "experience", "salary_range", "similarity_score",
+        "experience", "salary_range", "similarity_score", "isFeatured",
     }
 
 
@@ -298,11 +301,76 @@ def test_upsert_job_embedding_writes_sqlite_and_index(monkeypatch, tmp_path):
     assert result["index_total"] == 101
     conn = main.sqlite3.connect(db_path)
     try:
-        row = conn.execute("SELECT job_id, faiss_id, title FROM jobs WHERE job_id = 123").fetchone()
+        row = conn.execute("SELECT job_id, faiss_id, title, is_featured FROM jobs WHERE job_id = 123").fetchone()
     finally:
         conn.close()
-    assert row == (123, 100, "Backend Developer")
+    assert row == (123, 100, "Backend Developer", 0)
     assert index_path.exists()
+
+
+def test_upsert_job_embedding_stores_featured_flag(monkeypatch, tmp_path):
+    db_path = tmp_path / "jobs.db"
+    index_path = tmp_path / "jobs.index"
+    fake_index = FakeIndex()
+    monkeypatch.setattr(main, "DB_PATH", str(db_path))
+    monkeypatch.setattr(main, "INDEX_PATH", str(index_path))
+    monkeypatch.setattr(main, "MODEL", FakeST())
+    monkeypatch.setattr(main, "INDEX", fake_index)
+    monkeypatch.setattr(main.faiss, "write_index", lambda index, path: index_path.write_text("index"))
+
+    main.upsert_job_embedding({
+        "job_id": 456,
+        "title": "Featured Backend Developer",
+        "company": "Jobify",
+        "description": "Build APIs",
+        "qualifications": "Python",
+        "responsibilities": "Develop services",
+        "skills": "FastAPI SQL",
+        "experience": "Junior",
+        "location": "Cairo",
+        "work_type": "Remote",
+        "salary_range": "Negotiable",
+        "isFeatured": True,
+    })
+
+    conn = main.sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT is_featured FROM jobs WHERE job_id = 456").fetchone()
+    finally:
+        conn.close()
+    assert row == (1,)
+
+
+def test_featured_jobs_are_sorted_before_non_featured(monkeypatch, tmp_path):
+    db_path = tmp_path / "jobs.db"
+    monkeypatch.setattr(main, "DB_PATH", str(db_path))
+    monkeypatch.setattr(main, "MODEL", FakeST())
+
+    class RankingIndex:
+        ntotal = 2
+        def search(self, vector, k):
+            import numpy as np
+            return np.array([[0.95, 0.80]], dtype="float32"), np.array([[0, 1]], dtype="int64")
+
+    monkeypatch.setattr(main, "INDEX", RankingIndex())
+    conn = main.sqlite3.connect(db_path)
+    try:
+        main.ensure_jobs_table(conn)
+        conn.execute(
+            "INSERT INTO jobs (faiss_id, job_id, title, company, is_featured) VALUES (?, ?, ?, ?, ?)",
+            (0, 1, "Normal Job", "ACME", 0),
+        )
+        conn.execute(
+            "INSERT INTO jobs (faiss_id, job_id, title, company, is_featured) VALUES (?, ?, ?, ?, ?)",
+            (1, 2, "Featured Job", "ACME", 1),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    results = main.search_hybrid("python", k=2)
+    assert [job["title"] for job in results] == ["Featured Job", "Normal Job"]
+    assert results[0]["isFeatured"] is True
 
 
 def test_upsert_job_embedding_accepts_guid_job_ids(monkeypatch, tmp_path):
