@@ -1,4 +1,49 @@
-﻿# Jobify AI Backend Frontend Integration Report
+# Jobify AI Backend Frontend Integration Report
+
+## Latest Frontend Repository Update
+
+- A fresh frontend copy was cloned from `https://github.com/ibrahimsaleh8/Graduation_Project`.
+- The connected frontend lives in `D:/Machine Learning Projects/ml/pro34/frontend/Graduation_Project`.
+- The previous frontend copy was preserved as `frontend\Graduation_Project.backup_20260625_190042`.
+- The frontend now contains local Next.js proxy routes for applicant and company AI flows.
+- A safe `.env.example` file was added. The real `.env.local` file must stay uncommitted.
+
+## New Connected Frontend Repository Contents
+
+The frontend repository now includes:
+
+- `app/api/ai/chat/route.ts`
+- `app/api/ai/search/route.ts`
+- `app/api/ai/company/chat/route.ts`
+- `app/api/ai/company/find-candidates/route.ts`
+- `app/(Dashboard)/_components/AIChatBot.tsx`
+- `components/main-layout/InitilaizeAuthedUser.tsx`
+- `lib/DashboardAuthGuard.ts`
+- `proxy.ts`
+- `.env.example`
+- `README.md`
+
+## Tested Frontend Flows
+
+- Applicant AI chat page: `http://127.0.0.1:3000/dashboard/employee/ai-chat`
+- Company AI chat page: `http://127.0.0.1:3000/dashboard/company/ai-chat`
+- Applicant proxy test: `POST /api/ai/chat`
+- Company proxy test: `POST /api/ai/company/chat`
+
+Both proxy tests successfully reached the AI backend running at `http://127.0.0.1:8000`.
+
+## Company Test Account From Deployed DB
+
+The deployed SQL database contains this company record that can be used for company-side testing:
+
+| Field | Value |
+| --- | --- |
+| Company name | `Lockman and Sons` |
+| CompanyID | `AB16E3E4-B398-454E-B62B-0F2D6BAD9411` |
+| UserID | `abc88b66-93a8-47c2-9242-5c3f76fa038c` |
+| Email | `Liza30@hotmail.com` |
+
+Real login still requires the account password or a reset/test password from the .NET backend team because the database stores only `PasswordHash`, not the plain password.
 
 ## Current Services
 
