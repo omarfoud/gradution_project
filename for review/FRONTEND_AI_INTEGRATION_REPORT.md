@@ -163,7 +163,8 @@ Recommended response shape:
       "work_type": "Remote",
       "experience": "Mid Level",
       "salary_range": "",
-      "similarity_score": 0.6111
+      "similarity_score": 0.6111,
+      "isFeatured": false
     }
   ]
 }
@@ -173,6 +174,7 @@ Frontend usage:
 
 - Use `POST /recommend-matches` directly for the `Recommended for You` page/section.
 - Use `POST /chat` for chatbot messages. When `recommended_jobs` exists, render those jobs inside the chat message as clickable job cards.
+- Use `isFeatured` to show a small Featured badge if desired. The AI backend already sorts featured jobs before non-featured jobs.
 - Render bot replies with lightweight Markdown formatting so bullets and bold text do not appear as raw `*` or `**` characters.
 
 ### Company Chatbot
@@ -283,6 +285,14 @@ Content-Type: application/json
 ```
 
 Important: SQL Server `JobID` values can be GUID strings. The AI backend now supports GUID job ids for this sync endpoint.
+
+Featured job priority:
+
+- The SQL Server `JobPostings.IsFeatured` column is read during this sync.
+- The value is stored in local `jobs.db` as `jobs.is_featured`.
+- Kaggle/imported jobs that do not have this label remain `is_featured = 0`.
+- Search and recommendation results are sorted with `isFeatured = true` first, then by semantic similarity.
+- API responses expose the frontend-friendly field `isFeatured`.
 
 ### Sync Applicant Resume Embedding After CV Upload
 

@@ -225,6 +225,32 @@ def test_sync_resume_embedding_endpoint(client, monkeypatch):
     }
 
 
+def test_sync_application_match_score_endpoint(client, monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "compute_and_store_application_match_score",
+        lambda application_id: {
+            "status": "updated",
+            "application_id": application_id,
+            "applicant_id": "applicant-1",
+            "job_posting_id": "job-1",
+            "resume_id": "resume-1",
+            "matchScore": 76,
+            "match_score": 76,
+            "job": {"job_id": "job-1", "title": "Backend Developer", "company": "Jobify"},
+        },
+    )
+    res = client.post(
+        "/admin/sync-application-match-score",
+        headers={"X-Admin-API-Key": "test-admin-api-key-1234567890-test"},
+        json={"application_id": "application-1"},
+    )
+    assert res.status_code == 200
+    assert res.json()["application_id"] == "application-1"
+    assert res.json()["resume_id"] == "resume-1"
+    assert res.json()["matchScore"] == 76
+
+
 def test_search_empty_query_rejected(client):
     res = client.post("/search", json={"query": "", "limit": 5})
     assert res.status_code == 422

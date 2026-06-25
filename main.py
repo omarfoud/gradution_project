@@ -268,6 +268,10 @@ class SyncResumeEmbeddingRequest(BaseModel):
     force: bool = False
 
 
+class SyncApplicationMatchScoreRequest(BaseModel):
+    application_id: str = Field(..., min_length=1)
+
+
 class CompanyHiringInsightsRequest(CompanyContextRequest):
     job_posting_id: Optional[str] = None
 
@@ -1076,7 +1080,19 @@ def get_candidates_for_job(company_id: str, job_posting_id: str, limit: int) -> 
 
 
 def build_job_match_text(job: dict) -> str:
-    return " ".join(clean_embedding_text(value) for value in [job.get("title"), job.get("description"), job.get("responsibilities"), job.get("job_type"), job.get("salary_range")]).strip()
+    return " ".join(clean_embedding_text(value) for value in [
+        job.get("title"),
+        job.get("company"),
+        job.get("description"),
+        job.get("responsibilities"),
+        job.get("qualifications"),
+        job.get("skills"),
+        job.get("experience"),
+        job.get("location"),
+        job.get("work_type"),
+        job.get("job_type"),
+        job.get("salary_range"),
+    ]).strip()
 
 
 def keyword_match_score(job_text: str, resume_text: str) -> int:
@@ -1154,6 +1170,99 @@ def save_candidate_match_scores(candidates: list[dict]) -> None:
         conn.commit()
     except pyodbc.Error as exc:
         logger.warning("Failed to save candidate MatchScore values: %s", exc)
+    finally:
+        conn.close()
+
+
+def compute_and_store_application_match_score(application_id: str) -> dict:
+    conn = get_app_db()
+    try:
+        cursor = conn.cursor()
+        qualifications_expr = "jp.Qualifications" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Qualifications") else "CAST(NULL AS NVARCHAR(MAX))"
+        skills_expr = "jp.Skills" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Skills") else "CAST(NULL AS NVARCHAR(MAX))"
+        experience_expr = "jp.Experience" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Experience") else "CAST(NULL AS NVARCHAR(MAX))"
+        job_location_expr = "jp.Location" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Location") else "c.Location"
+        cursor.execute(
+            f"""
+            SELECT TOP 1
+                app.ApplicationID,
+                app.ApplicantID,
+                app.JobPostingID,
+                app.ResumeID,
+                selectedResume.FilePath,
+                jp.Title,
+                c.Name,
+                jp.Description,
+                jp.Responsibility,
+                {qualifications_expr} AS Qualifications,
+                {skills_expr} AS Skills,
+                {experience_expr} AS Experience,
+                {job_location_expr} AS Location,
+                jp.JobTypes,
+                jp.MinSalary,
+                jp.MaxSalary
+            FROM {APPLICATION_TABLE} app
+            JOIN {JOB_POSTING_TABLE} jp ON jp.JobID = app.JobPostingID
+            LEFT JOIN {COMPANY_TABLE} c ON c.CompanyID = jp.CompanyID
+            LEFT JOIN {RESUME_TABLE} selectedResume
+                ON selectedResume.ResumeID = app.ResumeID
+                AND selectedResume.ApplicantID = app.ApplicantID
+            WHERE app.ApplicationID = ?
+            """,
+            str(application_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Application not found")
+        if row[3] is None:
+            raise HTTPException(status_code=400, detail="Application has no ResumeID. Save the submitted CV ResumeID before syncing MatchScore.")
+        if not row[4]:
+            raise HTTPException(status_code=400, detail="Submitted ResumeID has no readable FilePath.")
+        salary_range = "Negotiable"
+        if row[14] is not None and row[15] is not None:
+            salary_range = f"{float(row[14]):.2f} - {float(row[15]):.2f}"
+        job = {
+            "job_id": str(row[2]),
+            "title": row[5],
+            "company": row[6],
+            "description": row[7],
+            "responsibilities": row[8],
+            "qualifications": row[9],
+            "skills": row[10],
+            "experience": row[11],
+            "location": row[12],
+            "work_type": str(row[13]) if row[13] is not None else None,
+            "salary_range": salary_range,
+        }
+        resume_path = str(row[4])
+        resume_text = extract_text(load_resume_bytes(resume_path), resume_path)[:MAX_CV_CHARS]
+        match_score = calculate_cv_match_score(build_job_match_text(job), resume_text)
+        if not sql_column_exists(cursor, APPLICATION_TABLE, "MatchScore"):
+            raise HTTPException(status_code=500, detail=f"{APPLICATION_TABLE}.MatchScore column is missing")
+        cursor.execute(
+            f"UPDATE {APPLICATION_TABLE} SET MatchScore = ? WHERE ApplicationID = ?",
+            int(match_score),
+            str(application_id),
+        )
+        conn.commit()
+        return {
+            "status": "updated",
+            "application_id": str(row[0]),
+            "applicant_id": str(row[1]),
+            "job_posting_id": str(row[2]),
+            "resume_id": str(row[3]),
+            "matchScore": int(match_score),
+            "match_score": int(match_score),
+            "job": {
+                "job_id": job["job_id"],
+                "title": job["title"],
+                "company": job["company"],
+            },
+        }
+    except HTTPException:
+        raise
+    except pyodbc.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Application MatchScore sync failed: {exc}") from exc
     finally:
         conn.close()
 
@@ -1417,6 +1526,12 @@ def sync_resume_embedding(req: SyncResumeEmbeddingRequest, x_admin_key: Optional
     require_admin_key(x_admin_key)
     result = sync_resume_embedding_for_user(req.user_id, force=req.force)
     return result
+
+
+@app.post("/admin/sync-application-match-score")
+def sync_application_match_score(req: SyncApplicationMatchScoreRequest, x_admin_key: Optional[str] = Header(None, alias="X-Admin-API-Key")):
+    require_admin_key(x_admin_key)
+    return compute_and_store_application_match_score(req.application_id)
 
 
 @app.post("/clear-cache")
