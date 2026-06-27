@@ -21,12 +21,12 @@ import google.generativeai as genai
 import jwt
 import numpy as np
 import pyodbc
-import PyPDF2
 import requests
 from cachetools.func import ttl_cache
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from pypdf import PdfReader
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
@@ -421,7 +421,7 @@ def extract_text(file_content: bytes, filename: str) -> str:
     try:
         if is_pdf:
             try:
-                reader = PyPDF2.PdfReader(io.BytesIO(file_content))
+                reader = PdfReader(io.BytesIO(file_content))
                 text = "\n".join((page.extract_text() or "") for page in reader.pages)
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"Failed to parse PDF file. Ensure it is a valid, uncorrupted PDF document. Error: {exc}")

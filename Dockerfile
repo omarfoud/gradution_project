@@ -31,6 +31,13 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.3.1 && \
     pip install --no-cache-dir -r requirements.txt
 
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+    sentence-transformers==2.7.0 \
+    transformers==4.41.2 \
+    tokenizers==0.19.1 \
+    huggingface-hub==0.23.5 \
+    Pillow==10.4.0
+
 COPY . .
 
 RUN mkdir -p /app/artifacts
