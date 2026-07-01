@@ -53,7 +53,7 @@ SQL_DRIVER = os.getenv("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
 SQL_ENCRYPT = os.getenv("SQL_ENCRYPT", "yes")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-key")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_ALGORITHMS = [alg.strip() for alg in os.getenv("JWT_ALGORITHMS", os.getenv("JWT_ALGORITHM", "HS256,HS512")).split(",") if alg.strip()]
 REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() in ("true", "1", "yes")
 FAISS_SAVE_DIRECT = os.getenv("FAISS_SAVE_DIRECT", "false").lower() in ("true", "1", "yes")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
@@ -88,6 +88,7 @@ RESUME_TABLE = get_sql_identifier("SQL_TABLE_RESUME", "Resumes")
 COMPANY_TABLE = get_sql_identifier("SQL_TABLE_COMPANY", "Companies")
 JOB_POSTING_TABLE = get_sql_identifier("SQL_TABLE_JOB_POSTING", "JobPostings")
 APPLICATION_TABLE = get_sql_identifier("SQL_TABLE_APPLICATION", "Applications")
+JOB_SKILLS_TABLE = get_sql_identifier("SQL_TABLE_JOB_SKILLS", "JobSkills")
 RESUME_EMBEDDING_TABLE = get_sql_identifier("SQL_TABLE_RESUME_EMBEDDING", "ResumeEmbeddings")
 
 ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
@@ -95,6 +96,12 @@ ALLOWED_RESUME_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_RESUME_D
 
 FAISS_TOP_K = int(os.getenv("FAISS_TOP_K", "500"))
 RESULTS_LIMIT = int(os.getenv("RESULTS_LIMIT", "10"))
+CHAT_RECOMMENDED_JOBS_LIMIT = 5
+CHAT_RECOMMENDED_JOBS_SEARCH_LIMIT = 200
+BACKEND_JOB_ID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 MAX_CV_CHARS = int(os.getenv("MAX_CV_CHARS", "4000"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
 SQL_BATCH_SIZE = int(os.getenv("SQL_BATCH_SIZE", "900"))
@@ -189,7 +196,7 @@ class RecommendRequest(BaseModel):
     location: Optional[str] = None
     work_type: Optional[str] = None
     experience: Optional[str] = None
-    limit: int = Field(default=5, ge=1, le=50)
+    limit: int = Field(default=5, ge=1, le=200)
 
 
 class AnalyzeJobRequest(BaseModel):
@@ -210,6 +217,26 @@ class ChatRequest(BaseModel):
     user_id: Optional[str] = None
 
 
+SUBJECT_CLAIM_KEYS = (
+    "sub",
+    "nameid",
+    "nameidentifier",
+    "user_id",
+    "userId",
+    "uid",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier",
+    "http://schemas.microsoft.com/ws/2008/06/identity/claims/nameidentifier",
+)
+
+
+def get_token_subject(payload: dict) -> Optional[str]:
+    for key in SUBJECT_CLAIM_KEYS:
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
 def check_auth(requested_id: Optional[str], auth_header: Optional[str] = None) -> Optional[dict]:
     if not auth_header:
         if REQUIRE_AUTH:
@@ -220,12 +247,13 @@ def check_auth(requested_id: Optional[str], auth_header: Optional[str] = None) -
         raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
     token = parts[1]
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=JWT_ALGORITHMS, options={"verify_aud": False})
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail=f"Invalid or expired token: {exc}") from exc
-    sub = payload.get("sub")
+    sub = get_token_subject(payload)
     if not sub:
-        raise HTTPException(status_code=401, detail="Token is missing 'sub' claim")
+        raise HTTPException(status_code=401, detail="Token is missing a subject claim")
+    payload["sub"] = sub
     if requested_id and str(sub) != str(requested_id):
         raise HTTPException(status_code=403, detail="Forbidden: Token subject does not match requested context")
     return payload
@@ -782,7 +810,7 @@ def search_hybrid_vector(vector: np.ndarray, *, k: int = RESULTS_LIMIT, location
     if not os.path.exists(DB_PATH):
         raise HTTPException(status_code=503, detail="jobs.db is missing.")
 
-    search_k = FAISS_TOP_K
+    search_k = max(FAISS_TOP_K, min(k * 10, 3000))
     if location or work_type or experience:
         search_k = max(search_k, 2000)
     ntotal = int(getattr(INDEX, "ntotal", 0))
@@ -998,14 +1026,57 @@ def sql_column_exists(cursor, table_name: str, column_name: str) -> bool:
     return cursor.fetchone()[0] is not None
 
 
+def normalize_enum_collection(value, labels: dict[str, str]) -> list[str]:
+    if value is None:
+        return []
+    tokens = re.findall(r"\d+|[A-Za-z][A-Za-z\s_-]*", str(value))
+    normalized = []
+    for token in tokens:
+        item = labels.get(token.strip(), token.strip())
+        if item and item not in normalized:
+            normalized.append(item)
+    return normalized
+
+
+def build_job_tags(job_types, work_approaches, is_remote) -> str:
+    tags = [
+        *normalize_enum_collection(job_types, {"0": "FullTime", "1": "PartTime"}),
+        *normalize_enum_collection(
+            work_approaches,
+            {"0": "OnSite", "1": "Hybrid", "2": "Remote"},
+        ),
+    ]
+    if not tags and is_remote:
+        tags.append("Remote")
+    return ", ".join(tags)
+
+
 def fetch_sql_job_for_embedding(job_posting_id: str, company_id: Optional[str] = None) -> dict:
     conn = get_app_db()
     try:
         cursor = conn.cursor()
         job_location_expr = "jp.Location" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Location") else "c.Location"
         qualifications_expr = "jp.Qualifications" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Qualifications") else "CAST(NULL AS NVARCHAR(MAX))"
-        skills_expr = "jp.Skills" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Skills") else "CAST(NULL AS NVARCHAR(MAX))"
-        experience_expr = "jp.Experience" if sql_column_exists(cursor, JOB_POSTING_TABLE, "Experience") else "CAST(NULL AS NVARCHAR(MAX))"
+        if sql_column_exists(cursor, JOB_POSTING_TABLE, "Skills"):
+            skills_expr = "jp.Skills"
+        elif (
+            sql_column_exists(cursor, JOB_SKILLS_TABLE, "Name")
+            and sql_column_exists(cursor, JOB_SKILLS_TABLE, "JobPostingId")
+        ):
+            skills_expr = f"(SELECT STRING_AGG(CAST(js.Name AS NVARCHAR(MAX)), ', ') FROM {JOB_SKILLS_TABLE} js WHERE js.JobPostingId = jp.JobID)"
+        else:
+            skills_expr = "CAST(NULL AS NVARCHAR(MAX))"
+        if sql_column_exists(cursor, JOB_POSTING_TABLE, "Experience"):
+            experience_expr = "jp.Experience"
+        elif (
+            sql_column_exists(cursor, JOB_POSTING_TABLE, "MinExperience")
+            and sql_column_exists(cursor, JOB_POSTING_TABLE, "MaxExperience")
+        ):
+            experience_expr = "CONCAT(COALESCE(CAST(jp.MinExperience AS NVARCHAR(20)), '0'), ' - ', COALESCE(CAST(jp.MaxExperience AS NVARCHAR(20)), '0'), ' Years')"
+        else:
+            experience_expr = "CAST(NULL AS NVARCHAR(MAX))"
+        job_types_expr = "jp.JobTypes" if sql_column_exists(cursor, JOB_POSTING_TABLE, "JobTypes") else "CAST(NULL AS NVARCHAR(MAX))"
+        work_approaches_expr = "jp.WorkApproaches" if sql_column_exists(cursor, JOB_POSTING_TABLE, "WorkApproaches") else "CAST(NULL AS NVARCHAR(MAX))"
         is_featured_expr = "jp.IsFeatured" if sql_column_exists(cursor, JOB_POSTING_TABLE, "IsFeatured") else "CAST(0 AS BIT)"
         where = "jp.JobID = ?"
         params = [str(job_posting_id)]
@@ -1024,7 +1095,8 @@ def fetch_sql_job_for_embedding(job_posting_id: str, company_id: Optional[str] =
                 {skills_expr} AS Skills,
                 {experience_expr} AS Experience,
                 {job_location_expr} AS Location,
-                jp.JobTypes,
+                {job_types_expr} AS JobTypes,
+                {work_approaches_expr} AS WorkApproaches,
                 jp.MinSalary,
                 jp.MaxSalary,
                 jp.IsRemote,
@@ -1045,9 +1117,9 @@ def fetch_sql_job_for_embedding(job_posting_id: str, company_id: Optional[str] =
         raise HTTPException(status_code=404, detail="Job posting not found")
 
     salary_range = "Negotiable"
-    if row[10] is not None and row[11] is not None:
-        salary_range = f"{float(row[10]):.2f} - {float(row[11]):.2f}"
-    work_type = str(row[9]) if row[9] is not None else ("Remote" if row[12] else None)
+    if row[11] is not None and row[12] is not None:
+        salary_range = f"{float(row[11]):.2f} - {float(row[12]):.2f}"
+    work_type = build_job_tags(row[9], row[10], row[13])
     return {
         "job_id": str(row[0]),
         "title": row[1],
@@ -1060,7 +1132,7 @@ def fetch_sql_job_for_embedding(job_posting_id: str, company_id: Optional[str] =
         "location": row[8],
         "work_type": work_type,
         "salary_range": salary_range,
-        "isFeatured": as_bool(row[13]),
+        "isFeatured": as_bool(row[14]),
     }
 
 
@@ -1295,6 +1367,20 @@ def summarize_recommended_jobs(jobs: list[dict]) -> list[dict]:
     } for j in jobs]
 
 
+def has_backend_job_id(job: dict) -> bool:
+    return bool(BACKEND_JOB_ID_PATTERN.match(str(job.get("job_id", ""))))
+
+
+def summarize_linkable_recommended_jobs(
+    jobs: list[dict],
+    *,
+    limit: int = CHAT_RECOMMENDED_JOBS_LIMIT,
+) -> list[dict]:
+    return summarize_recommended_jobs(
+        [job for job in jobs if has_backend_job_id(job)][:limit],
+    )
+
+
 def is_recommendation_message(message: str) -> bool:
     normalized = message.lower()
     english_phrases = [
@@ -1420,8 +1506,11 @@ def chat_general(req: ChatRequest, authorization: Optional[str] = Header(None)):
     if req.user_id:
         try:
             if wants_recommendations:
-                jobs = recommend_jobs_for_user(req.user_id, k=5)
-                recommended_jobs = summarize_recommended_jobs(jobs)
+                jobs = recommend_jobs_for_user(
+                    req.user_id,
+                    k=CHAT_RECOMMENDED_JOBS_SEARCH_LIMIT,
+                )
+                recommended_jobs = summarize_linkable_recommended_jobs(jobs)
                 recommendation_context = "\nRecommended jobs from the vector search result:\n" + json.dumps(recommended_jobs, ensure_ascii=False, indent=2) + "\n"
             else:
                 resume_text = get_resume_text_for_user(req.user_id)

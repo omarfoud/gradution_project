@@ -68,11 +68,36 @@ sys.modules["pyodbc"] = pyodbc_mod
 jwt_mod = types.ModuleType("jwt")
 class JWTError(Exception): pass
 jwt_mod.PyJWTError = JWTError
-jwt_mod.decode = lambda token, secret, algorithms: {"sub": "user1"}
+jwt_mod.decode = lambda token, secret, algorithms, **kwargs: {"sub": "user1"}
 sys.modules["jwt"] = jwt_mod
 
 # Now safe to import main
 import main
+
+ASP_NET_NAMEIDENTIFIER_CLAIM = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier"
+
+
+def test_check_auth_accepts_aspnet_nameid_claim(monkeypatch):
+    monkeypatch.setattr(main, "REQUIRE_AUTH", True)
+    monkeypatch.setattr(main.jwt, "decode", lambda token, secret, algorithms, **kwargs: {"nameid": "user-1"})
+
+    payload = main.check_auth("user-1", "Bearer token")
+
+    assert payload["sub"] == "user-1"
+
+
+def test_check_auth_accepts_aspnet_nameidentifier_uri_claim(monkeypatch):
+    monkeypatch.setattr(main, "REQUIRE_AUTH", True)
+    monkeypatch.setattr(
+        main.jwt,
+        "decode",
+        lambda token, secret, algorithms, **kwargs: {ASP_NET_NAMEIDENTIFIER_CLAIM: "user-1"},
+    )
+
+    payload = main.check_auth("user-1", "Bearer token")
+
+    assert payload["sub"] == "user-1"
+
 
 class SyncASGIClient:
     def __init__(self, app):
@@ -159,13 +184,35 @@ def test_chat_greeting_with_user_id_does_not_use_cv_context(client):
     assert "recommended_jobs" not in body
 
 
-def test_chat_recommendation_request_returns_jobs(client):
+def test_chat_recommendation_request_returns_jobs(client, monkeypatch):
+    backend_job_id = "01EBCD73-9073-4BC6-AEA8-FF24341F07DE"
+    monkeypatch.setattr(
+        main,
+        "recommend_jobs_for_user",
+        lambda user_id, **kwargs: [
+            {
+                "job_id": 1, "faiss_id": 0, "title": "Local FAISS Job", "company": "Local",
+                "description": "", "qualifications": "", "responsibilities": "",
+                "skills": "python", "experience": "junior", "location": "Cairo",
+                "work_type": "remote", "salary_range": "", "similarity_score": 0.99,
+                "isFeatured": False,
+            },
+            {
+                "job_id": backend_job_id, "faiss_id": 1, "title": "Data Scientist", "company": "ACME",
+                "description": "", "qualifications": "", "responsibilities": "",
+                "skills": "python", "experience": "junior", "location": "Cairo",
+                "work_type": "remote", "salary_range": "", "similarity_score": 0.9,
+                "isFeatured": False,
+            },
+        ],
+    )
+
     res = client.post("/chat", json={"message": "recommend jobs for me", "user_id": "user-1"})
     assert res.status_code == 200
     body = res.json()
     assert body["reply"] == "ok"
     assert body["recommended_jobs"] == [{
-        "job_id": 1,
+        "job_id": backend_job_id,
         "title": "Data Scientist",
         "company": "ACME",
         "location": "Cairo",
@@ -177,7 +224,29 @@ def test_chat_recommendation_request_returns_jobs(client):
     }]
 
 
-def test_chat_find_jobs_prompt_returns_recommendations(client):
+def test_chat_find_jobs_prompt_returns_recommendations(client, monkeypatch):
+    backend_job_id = "01EBCD73-9073-4BC6-AEA8-FF24341F07DE"
+    monkeypatch.setattr(
+        main,
+        "recommend_jobs_for_user",
+        lambda user_id, **kwargs: [
+            {
+                "job_id": 1, "faiss_id": 0, "title": "Local FAISS Job", "company": "Local",
+                "description": "", "qualifications": "", "responsibilities": "",
+                "skills": "python", "experience": "junior", "location": "Cairo",
+                "work_type": "remote", "salary_range": "", "similarity_score": 0.99,
+                "isFeatured": False,
+            },
+            {
+                "job_id": backend_job_id, "faiss_id": 1, "title": "Data Scientist", "company": "ACME",
+                "description": "", "qualifications": "", "responsibilities": "",
+                "skills": "python", "experience": "junior", "location": "Cairo",
+                "work_type": "remote", "salary_range": "", "similarity_score": 0.9,
+                "isFeatured": False,
+            },
+        ],
+    )
+
     res = client.post("/chat", json={"message": "Find jobs that match my skills", "user_id": "user-1"})
     assert res.status_code == 200
     body = res.json()

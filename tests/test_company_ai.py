@@ -89,7 +89,7 @@ jwt_mod = types.ModuleType("jwt")
 class JWTError(Exception): pass
 jwt_mod.PyJWTError = JWTError
 jwt_decoded_payload = {"sub": "company_user_1"}
-jwt_mod.decode = lambda token, secret, algorithms: jwt_decoded_payload
+jwt_mod.decode = lambda token, secret, algorithms, **kwargs: jwt_decoded_payload
 sys.modules.setdefault("jwt", jwt_mod)
 
 import main
@@ -110,7 +110,7 @@ class SyncASGIClient:
 def client(monkeypatch):
     monkeypatch.setattr(main, "generate_text", lambda prompt: "ok")
     monkeypatch.setattr(main, "REQUIRE_AUTH", True) # Force require auth for these tests
-    monkeypatch.setattr(main.jwt, "decode", lambda token, secret, algorithms: {"sub": "company_user_1"})
+    monkeypatch.setattr(main.jwt, "decode", lambda token, secret, algorithms, **kwargs: {"sub": "company_user_1"})
     import pyodbc
     monkeypatch.setattr(pyodbc, "connect", lambda *a, **kw: MockConnection())
     yield SyncASGIClient(main.app)

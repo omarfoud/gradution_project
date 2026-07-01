@@ -50,7 +50,7 @@ sys.modules.setdefault("pyodbc",pyodbc_mod)
 
 jwt_mod=types.ModuleType("jwt")
 class JE(Exception): pass
-jwt_mod.PyJWTError=JE; jwt_mod.decode=lambda t,s,algorithms:{"sub":"u1"}
+jwt_mod.PyJWTError=JE; jwt_mod.decode=lambda t,s,algorithms,**kwargs:{"sub":"u1"}
 sys.modules.setdefault("jwt",jwt_mod)
 
 import main
